@@ -1,111 +1,133 @@
-"""
-DSA TopK Indexer — Day-1 Baseline (Batched PyTorch)
-
-Implements dsa_topk_indexer_fp8_h64_d128_topk2048_ps64.
-DPS entry point: kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_indices)
-
-Key formula per batch element b:
-  scores[h, t] = q[b, h, :] dot K[t, :]   (no scale — baked into weights)
-  final[t] = sum_h( ReLU(scores[h, t]) * weights[b, h] )
-  topk_indices[b, :] = top-2048 token indices (global: page_id * page_size + offset)
-"""
+"""DSA TopK Indexer - Triton + PyTorch hybrid."""
 
 import torch
-
+import triton
+import triton.language as tl
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
 NUM_HEADS = 64
 TOPK = 2048
+PAGE_BYTES = PAGE_SIZE * (HEAD_DIM + 4)  # 8448
 
 
-def _dequant_fp8_kv_cache(k_index_cache_fp8):
-    """Dequantize FP8 KV cache from deep_gemm packed format.
+@triton.jit
+def _dsa_score_kernel(
+    Q_ptr,
+    K_cache_ptr,
+    weights_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    scores_out_ptr,
+    num_pages_total,
+    stride_q_b, stride_q_h, stride_q_d,
+    stride_w_b, stride_w_h,
+    stride_bt_b, stride_bt_p,
+    stride_so_b, stride_so_t,
+    max_seq_len,
+    BLOCK_T: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    D_HEAD: tl.constexpr,
+    PG_BYTES: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_p = tl.program_id(1)
 
-    Input layout per page (page_size * 132 bytes):
-      [0 : page_size * 128]  FP8 E4M3 data  (all tokens, then next token...)
-      [page_size * 128 : ]   float32 scales  (one per token)
+    seq_len = tl.load(seq_lens_ptr + pid_b)
+    page_start = pid_p * BLOCK_T
+    t_local = tl.arange(0, BLOCK_T)
+    global_t = page_start + t_local
+    d_off = tl.arange(0, D_HEAD)
 
-    The tensor [num_pages, page_size, 1, 132] is stored row-major, so
-    viewing as [num_pages, page_size * 132] gives the flat byte layout.
-    """
-    k_u8 = k_index_cache_fp8.view(torch.uint8)
-    num_pages, page_size, _, head_dim_sf = k_u8.shape
-    head_dim = head_dim_sf - 4  # 128
+    page_active = page_start < seq_len
 
-    kv_flat = k_u8.view(num_pages, page_size * head_dim_sf)
+    page_id = tl.load(block_table_ptr + pid_b * stride_bt_b + pid_p * stride_bt_p)
+    page_base = page_id * PG_BYTES
 
-    # FP8 data: first page_size * head_dim bytes
-    fp8_bytes = kv_flat[:, :page_size * head_dim].contiguous()
-    fp8_tensor = fp8_bytes.view(num_pages, page_size, head_dim).view(torch.float8_e4m3fn)
-    fp8_float = fp8_tensor.float()
+    # Load FP8 K data: token t, dim d at byte (page_base + t*128 + d)
+    k_ptrs = K_cache_ptr + page_base + t_local[:, None] * D_HEAD + d_off[None, :]
+    k_int8 = tl.load(k_ptrs, mask=page_active, other=0)
+    k_fp8 = k_int8.to(tl.float8e4nv, bitcast=True)
+    k_float = k_fp8.to(tl.float32)
 
-    # Scale: last page_size * 4 bytes → float32
-    scale_bytes = kv_flat[:, page_size * head_dim:].contiguous()
-    scale = scale_bytes.view(num_pages, page_size, 4).view(torch.float32)  # [num_pages, page_size, 1]
+    # Load scale: 4 bytes per token at (page_base + 64*128 + t*4)
+    sc_base = K_cache_ptr + page_base + BLOCK_T * D_HEAD
+    # Load each scale byte as int8, widen to int32, then mask to unsigned value.
+    # Cannot use .to(tl.uint8) — Triton may saturate negative int8 to 0 instead of wrapping.
+    # The & 0xFF ensures correct unsigned interpretation: int8(-61) → int32(-61) → & 0xFF → 195.
+    sb0 = tl.load(sc_base + t_local * 4 + 0, mask=page_active, other=0).to(tl.int32) & 0xFF
+    sb1 = tl.load(sc_base + t_local * 4 + 1, mask=page_active, other=0).to(tl.int32) & 0xFF
+    sb2 = tl.load(sc_base + t_local * 4 + 2, mask=page_active, other=0).to(tl.int32) & 0xFF
+    sb3 = tl.load(sc_base + t_local * 4 + 3, mask=page_active, other=0).to(tl.int32) & 0xFF
+    scale_int = sb0 | (sb1 << 8) | (sb2 << 16) | (sb3 << 24)
+    scale = scale_int.to(tl.float32, bitcast=True)
 
-    return fp8_float * scale  # [num_pages, page_size, head_dim]
+    k_dequant = k_float * scale[:, None]
+
+    # Accumulate scores across heads
+    final_scores = tl.zeros([BLOCK_T], dtype=tl.float32)
+    for h in range(N_HEADS):
+        q_ptrs = Q_ptr + pid_b * stride_q_b + h * stride_q_h + d_off * stride_q_d
+        q_fp8 = tl.load(q_ptrs)
+        q_float = q_fp8.to(tl.float32)
+        dot = tl.sum(k_dequant * q_float[None, :], axis=1)
+        dot = tl.maximum(dot, 0.0)
+        w_h = tl.load(weights_ptr + pid_b * stride_w_b + h * stride_w_h)
+        final_scores += dot * w_h
+
+    # Mask invalid tokens
+    mask_valid = global_t < seq_len
+    final_scores = tl.where(mask_valid, final_scores, float("-inf"))
+
+    # Write output
+    out_ptrs = scores_out_ptr + pid_b * stride_so_b + global_t * stride_so_t
+    mask_bounds = global_t < max_seq_len
+    tl.store(out_ptrs, final_scores, mask=mask_bounds)
 
 
 def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_indices):
-    """DSA TopK Indexer — DPS entry point.
-
-    Args:
-        q_index_fp8:        [batch_size, 64, 128]  float8_e4m3fn
-        k_index_cache_fp8:  [num_pages, 64, 1, 132]  int8 (deep_gemm packed FP8)
-        weights:            [batch_size, 64]  float32
-        seq_lens:           [batch_size]  int32
-        block_table:        [batch_size, max_num_pages]  int32
-        topk_indices:       [batch_size, 2048]  int32  (OUTPUT — write in-place)
-    """
     B = q_index_fp8.shape[0]
     num_pages_total = k_index_cache_fp8.shape[0]
     max_num_pages = block_table.shape[1]
     max_seq_len = max_num_pages * PAGE_SIZE
     device = q_index_fp8.device
 
-    # --- Dequantize ---
-    q = q_index_fp8.float()  # [B, 64, 128]
-    K_all = _dequant_fp8_kv_cache(k_index_cache_fp8)  # [num_pages_total, 64, 128]
+    scores = torch.full((B, max_seq_len), float("-inf"), dtype=torch.float32, device=device)
 
-    # --- Gather K pages for all batch elements ---
-    page_ids = block_table.long().clamp(0, num_pages_total - 1)  # [B, max_num_pages]
-    K_gathered = K_all[page_ids]  # [B, max_num_pages, 64, 128]
-    K_flat = K_gathered.view(B, max_seq_len, HEAD_DIM)  # [B, max_seq_len, 128]
+    grid = (B, max_num_pages)
+    _dsa_score_kernel[grid](
+        q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, scores,
+        num_pages_total,
+        q_index_fp8.stride(0), q_index_fp8.stride(1), q_index_fp8.stride(2),
+        weights.stride(0), weights.stride(1),
+        block_table.stride(0), block_table.stride(1),
+        scores.stride(0), scores.stride(1),
+        max_seq_len,
+        BLOCK_T=PAGE_SIZE,
+        N_HEADS=NUM_HEADS,
+        D_HEAD=HEAD_DIM,
+        PG_BYTES=PAGE_BYTES,
+        num_warps=4,
+        num_stages=1,
+    )
 
-    # --- Batched GEMM: q @ K.T ---
-    scores = torch.bmm(q, K_flat.transpose(1, 2))  # [B, 64, max_seq_len]
-
-    # --- ReLU + weighted sum across heads ---
-    scores = torch.relu(scores)  # [B, 64, max_seq_len]
-    final_scores = torch.einsum('bht,bh->bt', scores, weights)  # [B, max_seq_len]
-
-    # --- Mask positions beyond each sequence's length ---
-    positions = torch.arange(max_seq_len, device=device).unsqueeze(0)  # [1, max_seq_len]
-    seq_lens_long = seq_lens.long()
-    mask = positions >= seq_lens_long.unsqueeze(1)  # [B, max_seq_len]
-    final_scores.masked_fill_(mask, float('-inf'))
-
-    # --- TopK ---
+    # Top-K
     actual_k = min(TOPK, max_seq_len)
-    _, topk_local = torch.topk(final_scores, k=actual_k, dim=1)  # [B, actual_k]
+    _, topk_local = torch.topk(scores, k=actual_k, dim=1)
 
-    # --- Convert local indices to global token indices ---
-    # local index i maps to: page = i // PAGE_SIZE, offset = i % PAGE_SIZE
-    # global token = physical_page_id * PAGE_SIZE + offset
-    page_local = topk_local // PAGE_SIZE  # [B, actual_k] — which page (0..max_num_pages-1)
-    offset = topk_local % PAGE_SIZE       # [B, actual_k] — token within page
+    # Convert local indices to global token indices
+    page_local = topk_local // PAGE_SIZE
+    offset = topk_local % PAGE_SIZE
+    page_ids = block_table.long()
+    global_page_id = torch.gather(page_ids, 1, page_local.long())
+    result = (global_page_id * PAGE_SIZE + offset).to(torch.int32)
 
-    # Look up physical page IDs from block_table
-    global_page_id = torch.gather(page_ids, 1, page_local)  # [B, actual_k]
-    result = (global_page_id * PAGE_SIZE + offset).to(torch.int32)  # [B, actual_k]
-
-    # --- Write output ---
     topk_indices.fill_(-1)
     topk_indices[:, :actual_k] = result
 
-    # Mark padding positions as -1 for sequences shorter than TOPK
-    actual_topk_per_batch = torch.clamp(seq_lens_long, max=TOPK)  # [B]
-    idx_range = torch.arange(TOPK, device=device).unsqueeze(0)    # [1, 2048]
-    invalid_mask = idx_range >= actual_topk_per_batch.unsqueeze(1) # [B, 2048]
+    # Mark padding for short sequences
+    seq_lens_long = seq_lens.long()
+    actual_topk_per_batch = torch.clamp(seq_lens_long, max=TOPK)
+    idx_range = torch.arange(TOPK, device=device).unsqueeze(0)
+    invalid_mask = idx_range >= actual_topk_per_batch.unsqueeze(1)
     topk_indices[invalid_mask] = -1
