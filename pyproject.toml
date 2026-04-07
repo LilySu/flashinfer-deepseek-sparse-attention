@@ -1,0 +1,10 @@
+[project]
+name = "flashinfer-deepseek-sparse-attention"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "modal>=1.4.1",
+    "pydantic>=2.12.5",
+]
