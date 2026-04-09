@@ -1,7 +1,7 @@
-"""DSA TopK Indexer — CUDA dequant + CUDA Q convert.
+"""DSA TopK Indexer — Hybrid CUDA dequant: bulk for large B, per-batch for small B.
 
-Step 1: Add only CUDA Q FP8→FP32 conversion to the proven baseline.
-Everything else identical to proven 2.5x version.
+For small workloads (B × max_pages < total_pages / 2): dequant per-batch (less work).
+For large workloads: dequant all pages upfront (less launch overhead).
 """
 
 import os
@@ -13,6 +13,7 @@ PAGE_SIZE = 64
 HEAD_DIM = 128
 NUM_HEADS = 64
 TOPK = 2048
+PAGE_BYTES_RAW = PAGE_SIZE * (HEAD_DIM + 4)
 
 _cuda_module = None
 
@@ -39,18 +40,28 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_
     device = q_index_fp8.device
     mod = _get_module()
 
-    # CUDA: FP8 dequant
-    pages_flat = k_index_cache_fp8.view(torch.uint8).reshape(-1)
-    num_pages = pages_flat.numel() // (PAGE_SIZE * (HEAD_DIM + 4))
-    K_all = torch.empty(num_pages, PAGE_SIZE, HEAD_DIM, device=device, dtype=torch.float32)
-    mod.dequant_fp8(pages_flat, K_all)
-
     # CUDA: Q FP8→FP32
     q = torch.empty(B, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.float32)
     mod.convert_q(q_index_fp8.view(torch.uint8), q)
-    torch.cuda.synchronize()
 
     seq_lens_cpu = seq_lens.cpu().tolist()
+
+    num_pages_total = k_index_cache_fp8.shape[0]
+    max_pages_needed = max((int(sl) + PAGE_SIZE - 1) // PAGE_SIZE for sl in seq_lens_cpu)
+    total_pages_used = B * max_pages_needed  # upper bound
+
+    # Decide: bulk dequant all vs per-batch dequant
+    use_bulk = total_pages_used > num_pages_total // 2
+
+    if use_bulk:
+        # Bulk dequant all pages (better for large B)
+        pages_flat = k_index_cache_fp8.view(torch.uint8).reshape(-1)
+        K_all = torch.empty(num_pages_total, PAGE_SIZE, HEAD_DIM, device=device, dtype=torch.float32)
+        mod.dequant_fp8(pages_flat, K_all)
+        torch.cuda.synchronize()
+
+    kv_flat_pages = k_index_cache_fp8.view(torch.uint8).reshape(num_pages_total, PAGE_BYTES_RAW)
+
     topk_indices.fill_(-1)
 
     for b in range(B):
@@ -61,7 +72,15 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_
         num_pages_for_seq = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         page_indices = block_table[b, :num_pages_for_seq].long()
 
-        K_paged = K_all[page_indices]
+        if use_bulk:
+            K_paged = K_all[page_indices]
+        else:
+            # Per-batch dequant (better for small B)
+            selected_pages = kv_flat_pages[page_indices].reshape(-1)
+            n_pg = page_indices.shape[0]
+            K_paged = torch.empty(n_pg, PAGE_SIZE, HEAD_DIM, device=device, dtype=torch.float32)
+            mod.dequant_fp8(selected_pages, K_paged)
+
         K = K_paged.reshape(-1, HEAD_DIM)[:seq_len]
 
         q_b = q[b]
