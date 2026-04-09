@@ -15,8 +15,11 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "ninja")
 )
 
 
@@ -124,12 +127,12 @@ def run_benchmark_remote(solution_dict: dict) -> dict:
             if hasattr(trace.evaluation, 'stderr') and trace.evaluation.stderr:
                 entry["error"] = str(trace.evaluation.stderr)
             # Try to get any string representation of the evaluation for debugging
-            if status == "RUNTIME_ERROR":
-                entry["eval_dump"] = str(trace.evaluation)[:2000]
+            if status in ("RUNTIME_ERROR", "COMPILE_ERROR"):
+                entry["eval_dump"] = str(trace.evaluation)[:4000]
                 if hasattr(trace.evaluation, 'log') and trace.evaluation.log:
-                    entry["log"] = str(trace.evaluation.log)[:2000]
+                    entry["log"] = str(trace.evaluation.log)[:4000]
             results[trace.workload.uuid] = entry
-            if "PASS" in status.upper() or "CORRECT" in status.upper():
+            if status == "PASSED":
                 passed += 1
             else:
                 failed += 1

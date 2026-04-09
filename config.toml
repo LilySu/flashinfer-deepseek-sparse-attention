@@ -5,4 +5,4 @@ author = "FlashSelect"
 
 [build]
 language = "triton"
-entry_point = "kernel.py::kernel"
+entry_point = "binding.py::kernel"
