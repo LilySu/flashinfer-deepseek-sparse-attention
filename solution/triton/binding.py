@@ -51,7 +51,7 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_
     total_pages_used = B * max_pages_needed  # upper bound
 
     # Decide: bulk dequant all vs per-batch dequant
-    use_bulk = total_pages_used > num_pages_total // 2
+    use_bulk = total_pages_used > num_pages_total // 3
 
     if use_bulk:
         # Bulk dequant all pages (better for large B)
