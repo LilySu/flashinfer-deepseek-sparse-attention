@@ -48,19 +48,12 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_
 
     num_pages_total = k_index_cache_fp8.shape[0]
     max_pages_needed = max((int(sl) + PAGE_SIZE - 1) // PAGE_SIZE for sl in seq_lens_cpu)
-    total_pages_used = B * max_pages_needed  # upper bound
 
-    # Decide: bulk dequant all vs per-batch dequant
-    use_bulk = total_pages_used > num_pages_total // 3
+    # Flat KV cache for gather_dequant (single contiguous buffer)
+    kv_cache_flat = k_index_cache_fp8.view(torch.uint8).reshape(-1)
 
-    if use_bulk:
-        # Bulk dequant all pages (better for large B)
-        pages_flat = k_index_cache_fp8.view(torch.uint8).reshape(-1)
-        K_all = torch.empty(num_pages_total, PAGE_SIZE, HEAD_DIM, device=device, dtype=torch.float32)
-        mod.dequant_fp8(pages_flat, K_all)
-        torch.cuda.synchronize()
-
-    kv_flat_pages = k_index_cache_fp8.view(torch.uint8).reshape(num_pages_total, PAGE_BYTES_RAW)
+    # Pre-allocate K_paged buffer (avoids torch.empty per iteration)
+    K_paged_buf = torch.empty(max_pages_needed, PAGE_SIZE, HEAD_DIM, device=device, dtype=torch.float32)
 
     topk_indices.fill_(-1)
 
@@ -72,31 +65,22 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_
         num_pages_for_seq = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         page_indices = block_table[b, :num_pages_for_seq].long()
 
-        if use_bulk:
-            K_paged = K_all[page_indices]
-        else:
-            # Per-batch dequant (better for small B)
-            selected_pages = kv_flat_pages[page_indices].reshape(-1)
-            n_pg = page_indices.shape[0]
-            K_paged = torch.empty(n_pg, PAGE_SIZE, HEAD_DIM, device=device, dtype=torch.float32)
-            mod.dequant_fp8(selected_pages, K_paged)
+        # Fused gather + dequant (1 launch instead of gather + dequant = 2 launches)
+        K_paged = K_paged_buf[:num_pages_for_seq]
+        mod.gather_dequant_fp8(kv_cache_flat, page_indices, K_paged)
 
         K = K_paged.reshape(-1, HEAD_DIM)[:seq_len]
 
         q_b = q[b]
         scores = q_b @ K.T
-        scores_relu = torch.relu(scores)
 
-        w = weights[b]
-        weighted_scores = scores_relu * w[:, None]
-        final_scores = weighted_scores.sum(dim=0)
+        # relu + weight_mul: use in-place mul_ on relu output to avoid extra allocation
+        scores.clamp_(min=0)
+        scores.mul_(weights[b][:, None])
+        final_scores = scores.sum(dim=0)
 
         actual_topk = min(TOPK, seq_len)
         _, topk_idx = torch.topk(final_scores, actual_topk)
 
-        page_idx_per_token = topk_idx // PAGE_SIZE
-        offset_per_token = topk_idx % PAGE_SIZE
-        global_page_idx = page_indices[page_idx_per_token]
-        topk_tokens = global_page_idx * PAGE_SIZE + offset_per_token
-
-        topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
+        # Fused index remap — writes directly to output (no intermediate copy)
+        mod.fused_index_remap(topk_idx, page_indices, topk_indices[b, :actual_topk])
