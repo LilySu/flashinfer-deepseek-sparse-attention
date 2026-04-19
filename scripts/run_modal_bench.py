@@ -49,13 +49,21 @@ image = (
 )
 
 
+_DIAG_ENV = {"PHASE2A_DIAG": os.environ.get("PHASE2A_DIAG", "0")}
+
+
 @app.function(
     image=image,
     gpu="B200:1",
     timeout=3600,
     volumes={TRACE_SET_PATH: trace_volume},
+    secrets=[],
 )
 def run_benchmark() -> dict:
+    import json
+    # Forward diag env var from local invocation.
+    for k, v in _DIAG_ENV.items():
+        os.environ[k] = v
     """Pack solution in-container, run benchmark against DSA indexer workloads."""
     import tomllib
     from pathlib import Path as P
@@ -135,11 +143,22 @@ def run_benchmark() -> dict:
             entry["max_rel_err"] = ev.correctness.max_relative_error
         results.append(entry)
 
+    # Pull diag log if binding.py dropped one.
+    diag_entries = []
+    diag_path = P("/tmp/phase2a_diag.jsonl")
+    if diag_path.exists():
+        for line in diag_path.read_text().splitlines():
+            try:
+                diag_entries.append(json.loads(line))
+            except Exception:
+                pass
+
     return {
         "passed": pass_count,
         "failed": fail_count,
         "total": len(traces),
         "traces": results,
+        "diag": diag_entries,
     }
 
 
@@ -173,3 +192,37 @@ def main():
         print("\nFirst 5 non-PASSED workloads:")
         for t in failed[:5]:
             print(f"  {t}")
+
+    # Per-workload diagnostic from binding.py (if emitted)
+    diag = result.get("diag", [])
+    if diag:
+        print(f"\n--- DIAG ({len(diag)} entries) ---")
+        # Dedup on (B, num_pages, max_L, bt_shape[1]) so we see diverse shapes.
+        seen = set()
+        unique = []
+        for e in diag:
+            key = (e["B"], e["num_pages"], e["max_L"], tuple(e.get("bt_shape", [])))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(e)
+        unique.sort(key=lambda e: -e.get("worst_diff", 0))
+        for e in unique[:15]:
+            print(
+                f"  B={e['B']:3d} num_pages={e['num_pages']:5d} "
+                f"bt_shape={e.get('bt_shape')}  k_shape={e.get('k_shape')}  "
+                f"max_L={e['max_L']:6d} min_L={e['min_L']:6d}  "
+                f"worst_diff={e['worst_diff']:.4e} "
+                f"(b={e['worst_b']} L={e['worst_L']} pos={e['worst_pos']} "
+                f"ref={e['worst_ref']:.4f} cuda={e['worst_cuda']:.4f})"
+            )
+        # Buckets
+        buckets = {}
+        for e in diag:
+            key = (e["B"], e["max_L"] > 65536, e["min_L"] == e["max_L"])
+            buckets.setdefault(key, []).append(e["worst_diff"])
+        print("\n--- DIAG buckets (B, max_L>64K, uniform_lens) ---")
+        for k, ds in sorted(buckets.items()):
+            hi = sum(1 for x in ds if x > 0.1)
+            print(f"  B={k[0]:3d} big_L={k[1]} uniform={k[2]} "
+                  f"n={len(ds):3d}  mismatches>1e-1: {hi}  max_diff={max(ds):.4e}")
