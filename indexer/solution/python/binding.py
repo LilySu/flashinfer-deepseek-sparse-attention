@@ -42,7 +42,7 @@ def _build():
     if cutlass:
         extra_inc.append(cutlass)
     _MODULE = load(
-        name="dsa_topk_indexer_phase2b",
+        name="dsa_topk_indexer_phase2c",
         sources=[str(HERE / "kernel.cu")],
         extra_include_paths=extra_inc,
         extra_cuda_cflags=[
@@ -164,7 +164,7 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     q_u8 = q_index_fp8.view(torch.uint8)
     k_u8 = k_index_cache_fp8.view(torch.uint8)
 
-    mod.scoring_phase2b(q_u8, k_u8, weights, seq_lens, block_table, logits)
+    mod.scoring_phase2c(q_u8, k_u8, weights, seq_lens, block_table, logits)
 
     if _DIAG:
         torch.cuda.synchronize()

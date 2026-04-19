@@ -1,19 +1,22 @@
-// DSA topk indexer — Phase 2b: add cp.async.bulk TMA for paged-K loads.
+// DSA topk indexer — Phase 2c: 128-thread cooperative compute with 2-way
+// per-slot parallelism.
 //
-// Builds on Phase 2a's naive FP32 FMA scoring, adding async bulk copy
-// (via the Blackwell TMA unit) for the K cache page. The K transfer
-// (8448 B) is overlapped with Q FP8→FP32 staging, then an mbarrier wait
-// gates the compute. Q and weights loads remain cooperative SMEM stages.
-// Compute itself is unchanged — FP32 FMA in registers.
+// Builds on Phase 2b's TMA K-load. Block size goes from 32 → 128 (4 warps)
+// and per-slot work is split across 2 threads doing 32 heads each. Partial
+// sums combine via warp shuffle (`__shfl_xor_sync`). This quarters the
+// per-thread compute count (16K FMAs → 4K) while keeping total work the
+// same, boosting SM occupancy. Native tcgen05 UMMA with TMEM accumulator
+// is deferred to a future phase.
 //
-// Why this shape of 2b: the naive kernel is compute-bound (524K FMAs per
-// page, ~16K per thread), so full-throttle TMA + 2-stage pipeline won't
-// change the speed story much. The goal here is to prove the mbarrier +
-// cp.async.bulk primitives work correctly ahead of Phase 2c, where
-// tcgen05 UMMA with TMEM will need tensor-map TMA loaded K tiles.
+// Per-CTA layout:
+//   64 slots × 2 threads per slot = 128 threads
+//   Thread layout:  tid = slot * 2 + head_group, where head_group ∈ {0,1}
+//     head_group 0 owns heads [0..32),  head_group 1 owns heads [32..64)
+//   Partial sum per thread = Σ_h  w[h] * ReLU( Σ_d q[h,d] * dequant(k[slot,d]) )
+//   Final slot score = partial_0 + partial_1 via `__shfl_xor_sync(0xf...f, _, 1)`.
 //
-// Deferred to 2c: 132→144 SMEM stride padding (needed by UMMA tiling),
-// tensor-map TMA descriptors, 2-stage pipelined K/Q overlap.
+// Compute still FP32 FMA throughout — tensor-core path remains in a separate
+// track (mma.sync register layouts need dedicated bring-up time).
 
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
@@ -30,6 +33,10 @@ constexpr int kHeadDimWithScale = 132;                         // 128 FP8 + 4 sc
 constexpr int kFP8BytesPerPage  = kPageSize * kHeadDim;         // 8192
 constexpr int kScaleSectionOff  = kFP8BytesPerPage;             // scales start here within a page
 constexpr int kBytesPerPage     = kPageSize * kHeadDimWithScale; // 8448
+
+constexpr int kThreadsPerBlock  = 128;
+constexpr int kThreadsPerSlot   = 2;
+constexpr int kHeadsPerGroup    = kNumHeads / kThreadsPerSlot;  // 32
 
 // ---------------------------------------------------------------------------
 // Inline-PTX helpers for the SM100 async-barrier + bulk-copy path.
@@ -83,10 +90,11 @@ __device__ __forceinline__ void cp_async_bulk_g2s(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2b scoring kernel.
+// Phase 2c scoring kernel: 128-thread cooperative compute.
 // ---------------------------------------------------------------------------
 
-__global__ void scoring_kernel_phase2b(
+__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+scoring_kernel_phase2c(
     const uint8_t* __restrict__ q_fp8,        // [B, 64, 128]
     const uint8_t* __restrict__ k_cache,      // [num_pages, 64, 1, 132]
     const float*   __restrict__ weights,      // [B, 64]
@@ -126,9 +134,10 @@ __global__ void scoring_kernel_phase2b(
     __syncthreads();  // ensure k_bar and TMA issue are visible to all threads
 
     // Overlap the TMA of K with the cooperative Q FP8→FP32 conversion.
+    // With 128 threads, each does 64 Q elements and writes 0.5 weights on avg.
     const int64_t q_row_off =
         static_cast<int64_t>(batch) * kNumHeads * kHeadDim;
-    for (int i = tid; i < kNumHeads * kHeadDim; i += 32) {
+    for (int i = tid; i < kNumHeads * kHeadDim; i += kThreadsPerBlock) {
         const int h = i / kHeadDim;
         const int d = i % kHeadDim;
         __nv_fp8_e4m3 v;
@@ -136,7 +145,7 @@ __global__ void scoring_kernel_phase2b(
         std::memcpy(&v, &byte, 1);
         q_smem[h][d] = static_cast<float>(v);
     }
-    for (int i = tid; i < kNumHeads; i += 32) {
+    for (int i = tid; i < kNumHeads; i += kThreadsPerBlock) {
         w_smem[i] = weights[batch * kNumHeads + i];
     }
 
@@ -148,29 +157,42 @@ __global__ void scoring_kernel_phase2b(
     const int64_t row_base       = static_cast<int64_t>(batch) * max_seq_len_kv;
     const int     page_offset    = page_local * kPageSize;
 
-    for (int slot_iter = 0; slot_iter < 2; ++slot_iter) {
-        const int slot = tid + slot_iter * 32;
-        const int tok  = page_offset + slot;
+    // Thread layout: tid = slot * 2 + head_group.
+    //   head_group 0 covers heads [0, 32),  head_group 1 covers heads [32, 64).
+    const int slot       = tid >> 1;       // 0..63
+    const int head_group = tid & 1;        // 0 or 1
+    const int h_start    = head_group * kHeadsPerGroup;
+    const int h_end      = h_start + kHeadsPerGroup;
+    const int tok        = page_offset + slot;
 
-        if (tok < seq_len) {
-            float scale;
-            std::memcpy(&scale, k_smem + kScaleSectionOff + slot * 4, sizeof(float));
+    float partial = 0.0f;
+    if (tok < seq_len) {
+        float scale;
+        std::memcpy(&scale, k_smem + kScaleSectionOff + slot * 4, sizeof(float));
+        const uint8_t* kv_ptr = k_smem + slot * kHeadDim;
 
-            const uint8_t* kv_ptr = k_smem + slot * kHeadDim;
-
-            float acc = 0.0f;
-            for (int h = 0; h < kNumHeads; ++h) {
-                float dot = 0.0f;
-                for (int d = 0; d < kHeadDim; ++d) {
-                    __nv_fp8_e4m3 kv_raw;
-                    uint8_t kv_byte = kv_ptr[d];
-                    std::memcpy(&kv_raw, &kv_byte, 1);
-                    const float k_val = static_cast<float>(kv_raw) * scale;
-                    dot += q_smem[h][d] * k_val;
-                }
-                acc += w_smem[h] * fmaxf(dot, 0.0f);
+        for (int h = h_start; h < h_end; ++h) {
+            float dot = 0.0f;
+            for (int d = 0; d < kHeadDim; ++d) {
+                __nv_fp8_e4m3 kv_raw;
+                uint8_t kv_byte = kv_ptr[d];
+                std::memcpy(&kv_raw, &kv_byte, 1);
+                const float k_val = static_cast<float>(kv_raw) * scale;
+                dot += q_smem[h][d] * k_val;
             }
-            logits[row_base + tok] = acc;
+            partial += w_smem[h] * fmaxf(dot, 0.0f);
+        }
+    }
+
+    // Combine the 2 head-groups of this slot via warp shuffle.
+    // tid and tid^1 are always in the same warp (since they differ only in
+    // the LSB), so `__shfl_xor_sync` with mask 1 exchanges their partials.
+    partial += __shfl_xor_sync(0xffffffffu, partial, 1);
+
+    // head_group 0 writes the final slot score.
+    if (head_group == 0) {
+        if (tok < seq_len) {
+            logits[row_base + tok] = partial;
         } else {
             logits[row_base + tok] = -INFINITY;
         }
@@ -183,7 +205,7 @@ __global__ void scoring_kernel_phase2b(
 // Host entry (pybind).
 // -----------------------------------------------------------------------------
 
-void scoring_phase2b(
+void scoring_phase2c(
     torch::Tensor q_u8,
     torch::Tensor k_u8,
     torch::Tensor weights,
@@ -207,9 +229,9 @@ void scoring_phase2b(
     TORCH_CHECK(logits.size(1) == max_num_pages * kPageSize);
 
     const dim3 grid(max_num_pages, batch_size);
-    const dim3 block(32);
+    const dim3 block(kThreadsPerBlock);
 
-    scoring_kernel_phase2b<<<grid, block>>>(
+    scoring_kernel_phase2c<<<grid, block>>>(
         q_u8.data_ptr<uint8_t>(),
         k_u8.data_ptr<uint8_t>(),
         weights.data_ptr<float>(),
@@ -220,10 +242,10 @@ void scoring_phase2b(
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess,
-                "scoring_kernel_phase2b launch failed: ", cudaGetErrorString(err));
+                "scoring_kernel_phase2c launch failed: ", cudaGetErrorString(err));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("scoring_phase2b", &scoring_phase2b,
-          "Phase 2b indexer scoring: cp.async.bulk TMA K-load + FP32 FMA compute");
+    m.def("scoring_phase2c", &scoring_phase2c,
+          "Phase 2c indexer scoring: 128-thread cooperative FP32 FMA (2 threads/slot, shuffle-reduce)");
 }
