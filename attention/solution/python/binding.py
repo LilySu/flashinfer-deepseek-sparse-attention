@@ -19,7 +19,7 @@ from torch.utils.cpp_extension import load
 
 HERE = Path(__file__).resolve().parent
 
-_BACKEND = os.environ.get("DSA_ATTN_BACKEND", "cuda")  # "python" | "cuda"
+_BACKEND = os.environ.get("DSA_ATTN_BACKEND", "python")  # "python" | "cuda"
 _MODULE = None
 _BUILD_FAILED = False
 
