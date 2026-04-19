@@ -1,0 +1,9 @@
+[solution]
+name = "FlashSelect-attention-v1"
+definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+author = "FlashSelect"
+
+[build]
+language = "python"
+entry_point = "binding.py::kernel"
+destination_passing_style = false

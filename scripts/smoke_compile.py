@@ -1,25 +1,31 @@
 """Compile-only smoke test for the sm_100a kernel scaffold.
 
-Runs on Modal B200, calls binding._build() to JIT-compile kernel.cu with
--arch=sm_100a and the 5 CUTLASS/CuTe headers. Does NOT run benchmarks.
+Runs on Modal B200, JIT-compiles kernel.cu directly via
+torch.utils.cpp_extension.load() with -arch=sm_100a and the 5 CUTLASS/CuTe
+headers. Does NOT run benchmarks or invoke binding.py.
+
+Usage:
+    KERNEL=indexer   uvx modal run scripts/smoke_compile.py
+    KERNEL=attention uvx modal run scripts/smoke_compile.py
 
 Outcomes:
-  - PASS: CUTLASS resolves, sm_100a compiles, extension loads. Safe to
-    proceed with kernel logic.
-  - FAIL: header ENOENT → vendor CUTLASS into solution/python/third_party/
-  - FAIL: ptxas / nvcc error on sm_100a → check CUDA toolkit version in
-    image, may need CUDA 12.9+
+  - PASS: CUTLASS resolves, sm_100a compiles, extension loads.
+  - FAIL: header ENOENT → vendor CUTLASS into third_party/
+  - FAIL: ptxas / nvcc error on sm_100a → check CUDA toolkit version
 """
 
+import os
 from pathlib import Path
 import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+KERNEL = os.environ.get("KERNEL", "indexer")
+
 import modal
 
-app = modal.App("flashinfer-smoke-compile")
+app = modal.App(f"flashinfer-smoke-{KERNEL}")
 
 # Match the confirmed-working B200 image (CUDA 13.0 devel, has nvcc + ncu).
 # Contest eval uses CUDA 13.2; 13.0 is close enough for a compile probe
@@ -35,7 +41,7 @@ image = (
         "cd /opt/flashinfer-bench && pip install -v -e .",
     )
     .add_local_dir(
-        str(PROJECT_ROOT / "solution" / "python"),
+        str(PROJECT_ROOT / KERNEL / "solution" / "python"),
         remote_path="/root/solution/python",
     )
 )
@@ -82,43 +88,44 @@ def compile_and_load() -> dict:
         print("\n  flashinfer not importable")
 
     print("\n" + "=" * 60)
-    print("Compiling kernel.cu")
+    print("Compiling kernel.cu directly via torch.utils.cpp_extension.load")
     print("=" * 60)
-    import sys as _sys
-    _sys.path.insert(0, "/root/solution/python")
+    from torch.utils.cpp_extension import load
+
+    import flashinfer
+    cutlass_inc = str(Path(flashinfer.__file__).resolve().parent
+                       / "data" / "cutlass" / "include")
+    print(f"  cutlass_inc = {cutlass_inc}")
+
     try:
-        import binding
-        mod = binding._build()
+        mod = load(
+            name=f"smoke_kernel_sm100a",
+            sources=["/root/solution/python/kernel.cu"],
+            extra_include_paths=[cutlass_inc],
+            extra_cuda_cflags=[
+                "-arch=sm_100a",
+                "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "-O3",
+                "--use_fast_math",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            ],
+            extra_cflags=["-std=c++17", "-O3"],
+            verbose=False,
+        )
         print(f"\nCompile OK. Extension: {mod}")
-    except Exception as e:
-        print(f"\nCompile FAILED:\n{type(e).__name__}: {e}")
-        return {"status": "compile_failed", "error": str(e)}
-
-    print("\n" + "=" * 60)
-    print("Smoke-invoking kernel with dummy inputs")
-    print("=" * 60)
-    device = torch.device("cuda:0")
-    B, H, D, P = 2, 64, 128, 64
-    num_pages = 4
-    max_pages = 2
-
-    q = torch.zeros(B, H, D, dtype=torch.float8_e4m3fn, device=device)
-    k = torch.zeros(num_pages, P, 1, 132, dtype=torch.int8, device=device)
-    w = torch.zeros(B, H, dtype=torch.float32, device=device)
-    s = torch.zeros(B, dtype=torch.int32, device=device)
-    bt = torch.zeros(B, max_pages, dtype=torch.int32, device=device)
-
-    try:
-        out = binding.kernel(q, k, w, s, bt)
-        print(f"Invoke OK. Output shape: {out[0].shape}, dtype: {out[0].dtype}")
+        print(f"  exported fns: {[x for x in dir(mod) if not x.startswith('_')]}")
         return {
             "status": "pass",
-            "output_shape": list(out[0].shape),
-            "output_dtype": str(out[0].dtype),
+            "exports": [x for x in dir(mod) if not x.startswith('_')],
         }
     except Exception as e:
-        print(f"Invoke FAILED:\n{type(e).__name__}: {e}")
-        return {"status": "invoke_failed", "error": str(e)}
+        print(f"\nCompile FAILED:\n{type(e).__name__}: {e}")
+        return {"status": "compile_failed", "error": str(e)[:2000]}
 
 
 @app.local_entrypoint()

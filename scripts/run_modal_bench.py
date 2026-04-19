@@ -1,25 +1,29 @@
-"""Run the packed DSA indexer solution against contest workloads on Modal B200.
+"""Run a packed DSA solution against contest workloads on Modal B200.
 
 Matches yongwww's recommended eval env: flashinfer-bench from source (main),
 CUDA 13.0 devel image (has nvcc — needed even for Python-only solutions
 because some dependencies expect it).
 
 Usage:
-    uvx modal run scripts/run_modal_bench.py
+    KERNEL=indexer   uvx modal run scripts/run_modal_bench.py
+    KERNEL=attention uvx modal run scripts/run_modal_bench.py
 
 Pre-req: trace data must already be uploaded to the `flashinfer-trace`
 modal volume (see scripts/run_modal.py header for one-time setup).
 """
 
+import os
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+KERNEL = os.environ.get("KERNEL", "indexer")
+
 import modal
 
-app = modal.App("flashinfer-dsa-indexer-bench")
+app = modal.App(f"flashinfer-dsa-{KERNEL}-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
@@ -35,11 +39,11 @@ image = (
         "cd /opt/flashinfer-bench && pip install -v -e .",
     )
     .add_local_dir(
-        str(PROJECT_ROOT / "solution" / "python"),
+        str(PROJECT_ROOT / KERNEL / "solution" / "python"),
         remote_path="/root/submission/solution/python",
     )
     .add_local_file(
-        str(PROJECT_ROOT / "config.toml"),
+        str(PROJECT_ROOT / KERNEL / "config.toml"),
         remote_path="/root/submission/config.toml",
     )
 )
