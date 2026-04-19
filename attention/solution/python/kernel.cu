@@ -31,7 +31,7 @@ constexpr int kQoHeads    = 16;
 constexpr int kHeadDimCkv = 512;
 constexpr int kHeadDimKpe = 64;
 constexpr int kTopK       = 2048;
-constexpr int kBlockKv    = 64;
+constexpr int kBlockKv    = 64;   // Phase 5d tile tune winner (32:1.49x, 64:1.75x, 128:1.51x)
 constexpr int kNumChunks  = kTopK / kBlockKv;  // 32
 
 constexpr int kThreads    = 128;
@@ -162,24 +162,26 @@ attention_kernel_phase5b(
         }
         __syncthreads();
 
-        if (tid < kBlockKv) {
-            const int s = tid;
+        // Cover 2*kBlockKv TMA ops (kc + kp) with kThreads threads.
+        // When 2*kBlockKv > kThreads, each thread issues multiple ops.
+        for (int i = tid; i < 2 * kBlockKv; i += kThreads) {
+            const bool is_kp = (i >= kBlockKv);
+            const int s = is_kp ? (i - kBlockKv) : i;
             int32_t idx = sparse_idx[sp_base + chunk_off + s];
             int safe_idx = (idx >= 0) ? idx : 0;
-            cp_async_bulk_g2s(
-                &smem.kc[s][0],
-                ckv_flat + static_cast<int64_t>(safe_idx) * kHeadDimCkv,
-                kHeadDimCkv * sizeof(__nv_bfloat16),   // 1024 B
-                &smem.k_bar);
-        } else if (tid < 2 * kBlockKv) {
-            const int s = tid - kBlockKv;
-            int32_t idx = sparse_idx[sp_base + chunk_off + s];
-            int safe_idx = (idx >= 0) ? idx : 0;
-            cp_async_bulk_g2s(
-                &smem.kp[s][0],
-                kpe_flat + static_cast<int64_t>(safe_idx) * kHeadDimKpe,
-                kHeadDimKpe * sizeof(__nv_bfloat16),   // 128 B
-                &smem.k_bar);
+            if (is_kp) {
+                cp_async_bulk_g2s(
+                    &smem.kp[s][0],
+                    kpe_flat + static_cast<int64_t>(safe_idx) * kHeadDimKpe,
+                    kHeadDimKpe * sizeof(__nv_bfloat16),
+                    &smem.k_bar);
+            } else {
+                cp_async_bulk_g2s(
+                    &smem.kc[s][0],
+                    ckv_flat + static_cast<int64_t>(safe_idx) * kHeadDimCkv,
+                    kHeadDimCkv * sizeof(__nv_bfloat16),
+                    &smem.k_bar);
+            }
         }
 
         // Wait for all 128 TMAs this chunk to complete.
