@@ -107,18 +107,28 @@ print("attention kernel executed")
 
     # 3) Run under NCU: Pass-1 triage — LaunchStats + SpeedOfLight + Occupancy only.
     report_path = f"/ncu_reports/{KERNEL}_phase6_triage.ncu-rep"
+    # Filter to our actual kernel (scoring_kernel_phase2c for indexer,
+    # attention_kernel_phase5a for attention). Without this, NCU picks up
+    # torch's internal vectorized_elementwise_kernel from preinit ops.
+    kernel_regex = (
+        "scoring_kernel_phase" if KERNEL == "indexer"
+        else "attention_kernel_phase"
+    )
     cmd = [
         "/usr/local/cuda/bin/ncu",
         "--set", "basic",
         "--section", "LaunchStats",
         "--section", "Occupancy",
         "--section", "SpeedOfLight",
-        "--launch-skip", "5",
+        "--kernel-name-base", "mangled",
+        "--kernel-name", f"regex:{kernel_regex}",
+        "--launch-skip", "2",     # skip JIT warmup (after --kernel-name filter)
         "--launch-count", "1",
         "--cache-control", "all",
         "--replay-mode", "kernel",
         "--target-processes", "all",
         "--clock-control", "none",
+        "-f",                          # overwrite existing report
         "--export", report_path,
         "python3", "/tmp/ncu_runner.py",
     ]
