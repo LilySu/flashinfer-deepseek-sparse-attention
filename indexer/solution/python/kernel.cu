@@ -1,22 +1,19 @@
-// DSA topk indexer — Phase 2a: naive FP32 FMA scoring kernel.
+// DSA topk indexer — Phase 2b: add cp.async.bulk TMA for paged-K loads.
 //
-// This is the first sub-stage of the indexer Stage A (scoring). It's
-// intentionally unoptimized: single warp per CTA, plain FP32 FMA, no
-// TMA, no UMMA, no tensor cores. Target is correctness against the
-// PyTorch reference under rtol=1e-2, atol=1e-2.
+// Builds on Phase 2a's naive FP32 FMA scoring, adding async bulk copy
+// (via the Blackwell TMA unit) for the K cache page. The K transfer
+// (8448 B) is overlapped with Q FP8→FP32 staging, then an mbarrier wait
+// gates the compute. Q and weights loads remain cooperative SMEM stages.
+// Compute itself is unchanged — FP32 FMA in registers.
 //
-// Per-page layout of k_index_cache_fp8 (132 bytes per slot):
-//   bytes [0 .. page_size*head_dim)                 — FP8 data (slot*head_dim + d)
-//   bytes [page_size*head_dim .. page_size*132)     — FP32 scales (4 B per slot)
+// Why this shape of 2b: the naive kernel is compute-bound (524K FMAs per
+// page, ~16K per thread), so full-throttle TMA + 2-stage pipeline won't
+// change the speed story much. The goal here is to prove the mbarrier +
+// cp.async.bulk primitives work correctly ahead of Phase 2c, where
+// tcgen05 UMMA with TMEM will need tensor-map TMA loaded K tiles.
 //
-// Grid: (max_num_pages, batch_size). Each CTA = one warp = one page of
-// one batch. CTAs with page_local >= num_pages_for_batch early-return.
-//
-// Subsequent phases will add: TMA pipelined Q/K loads (2b), tcgen05 UMMA
-// with TMEM accumulator + per-page epilogue (2c). The CUTLASS/CuTe
-// arch headers needed for those phases are validated elsewhere
-// (scripts/smoke_compile.py) and are not yet included here — Phase 2a
-// has no CUTLASS dependency.
+// Deferred to 2c: 132→144 SMEM stride padding (needed by UMMA tiling),
+// tensor-map TMA descriptors, 2-stage pipelined K/Q overlap.
 
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
@@ -34,43 +31,101 @@ constexpr int kFP8BytesPerPage  = kPageSize * kHeadDim;         // 8192
 constexpr int kScaleSectionOff  = kFP8BytesPerPage;             // scales start here within a page
 constexpr int kBytesPerPage     = kPageSize * kHeadDimWithScale; // 8448
 
-// Naive scoring kernel.
-//
-// Each thread handles two slots (tid and tid+32). For each slot:
-//   final_scores[b, tok] = sum_h w[b,h] * ReLU( dot(q[b,h], dequant(kv[page,slot])) )
-// with dequant(kv)[d] = float(kv[d]) * scale[slot]. The scale is applied
-// elementwise inside the dot to match the PyTorch reference ordering
-// (`K_all_dequant = fp8_float * scale`, then matmul).
-//
-// Q and weights are staged in SMEM once per CTA and reused across all 64
-// slots in the page.
-__global__ void scoring_kernel_phase2a(
+// ---------------------------------------------------------------------------
+// Inline-PTX helpers for the SM100 async-barrier + bulk-copy path.
+// ---------------------------------------------------------------------------
+
+// Convert a generic pointer into a 32-bit shared-memory address (what the
+// `[%n]` operands in PTX require for SMEM operations).
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    uint32_t r;
+    asm volatile("{ .reg .u64 u; cvta.to.shared.u64 u, %1; cvt.u32.u64 %0, u; }"
+                 : "=r"(r) : "l"(p));
+    return r;
+}
+
+__device__ __forceinline__ void mbarrier_init(uint64_t* bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;"
+                 : : "r"(smem_addr(bar)), "r"(count));
+}
+
+// Signal one arrival on the barrier and tell it to expect tx_count bytes
+// from subsequent cp.async.bulk ops. This must be called AFTER mbarrier_init
+// and BEFORE (or alongside) the cp.async.bulk issue.
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* bar, uint32_t tx_count) {
+    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+                 : : "r"(smem_addr(bar)), "r"(tx_count));
+}
+
+// Spin until the barrier's current phase completes.
+__device__ __forceinline__ void mbarrier_wait(uint64_t* bar, uint32_t phase) {
+    uint32_t done;
+    do {
+        asm volatile("{ .reg .pred p;"
+                     "  mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;"
+                     "  selp.u32 %0, 1, 0, p; }"
+                     : "=r"(done) : "r"(smem_addr(bar)), "r"(phase));
+    } while (!done);
+}
+
+// Issue a bulk async copy from global to shared memory. On Blackwell this
+// dispatches through the TMA unit; unlike `cp.async.bulk.tensor.Nd` this
+// variant takes raw byte addresses (no tensor-map descriptor required).
+__device__ __forceinline__ void cp_async_bulk_g2s(
+    void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar
+) {
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1], %2, [%3];"
+        : : "r"(smem_addr(smem_dst)), "l"(gmem_src),
+            "r"(bytes), "r"(smem_addr(bar))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b scoring kernel.
+// ---------------------------------------------------------------------------
+
+__global__ void scoring_kernel_phase2b(
     const uint8_t* __restrict__ q_fp8,        // [B, 64, 128]
     const uint8_t* __restrict__ k_cache,      // [num_pages, 64, 1, 132]
     const float*   __restrict__ weights,      // [B, 64]
     const int32_t* __restrict__ seq_lens,     // [B]
     const int32_t* __restrict__ block_table,  // [B, max_num_pages]
-    float*         __restrict__ logits,       // [B, max_seq_len_kv] — caller preinits to -inf
+    float*         __restrict__ logits,       // [B, max_seq_len_kv] caller preinits to -inf
     int max_num_pages
 ) {
     const int page_local = blockIdx.x;
     const int batch      = blockIdx.y;
-    const int tid        = threadIdx.x;                 // 0..31, single warp
+    const int tid        = threadIdx.x;
 
     const int seq_len           = seq_lens[batch];
     const int num_pages_for_seq = (seq_len + kPageSize - 1) / kPageSize;
     if (page_local >= num_pages_for_seq) return;
 
-    // Resolve global page id and anchor pointer into the paged KV cache.
     const int page_id = block_table[batch * max_num_pages + page_local];
     const uint8_t* page_base =
         k_cache + static_cast<int64_t>(page_id) * kBytesPerPage;
 
-    // SMEM: Q[64,128] in FP32 (32 KiB) + weights[64] (256 B).
-    __shared__ float q_smem[kNumHeads][kHeadDim];
-    __shared__ float w_smem[kNumHeads];
+    __shared__ float                q_smem[kNumHeads][kHeadDim];        // 32 KiB
+    __shared__ alignas(16) uint8_t  k_smem[kBytesPerPage];              // 8448 B
+    __shared__ float                w_smem[kNumHeads];                   // 256 B
+    __shared__ alignas(8) uint64_t  k_bar;
 
-    // Cooperative load of Q: 8192 elements / 32 threads = 256/thread.
+    // Thread 0: init barrier and kick off the K page TMA bulk load. Because
+    // only 1 arrival is expected (thread 0 contributes the expect_tx that
+    // the cp.async.bulk completion decrements), count is 1.
+    if (tid == 0) {
+        mbarrier_init(&k_bar, 1);
+        // fence.proxy.async ensures prior SMEM writes (the mbarrier init)
+        // are visible before the async proxy (TMA) touches the same SMEM.
+        asm volatile("fence.proxy.async.shared::cta;");
+        mbarrier_arrive_expect_tx(&k_bar, kBytesPerPage);
+        cp_async_bulk_g2s(k_smem, page_base, kBytesPerPage, &k_bar);
+    }
+    __syncthreads();  // ensure k_bar and TMA issue are visible to all threads
+
+    // Overlap the TMA of K with the cooperative Q FP8→FP32 conversion.
     const int64_t q_row_off =
         static_cast<int64_t>(batch) * kNumHeads * kHeadDim;
     for (int i = tid; i < kNumHeads * kHeadDim; i += 32) {
@@ -81,30 +136,27 @@ __global__ void scoring_kernel_phase2a(
         std::memcpy(&v, &byte, 1);
         q_smem[h][d] = static_cast<float>(v);
     }
-    // 32 threads × 2 heads each = 64 heads. Previous bug: `if (tid < kNumHeads)`
-    // only wrote w_smem[0..31], leaving [32..63] uninitialized, which produced
-    // ±inf/garbage when multiplied with valid dot products in the accumulation.
     for (int i = tid; i < kNumHeads; i += 32) {
         w_smem[i] = weights[batch * kNumHeads + i];
     }
+
+    // Wait for K page to be fully delivered before reading from k_smem.
+    mbarrier_wait(&k_bar, 0);
     __syncthreads();
 
     const int     max_seq_len_kv = max_num_pages * kPageSize;
     const int64_t row_base       = static_cast<int64_t>(batch) * max_seq_len_kv;
     const int     page_offset    = page_local * kPageSize;
 
-    // Each thread handles 2 slots (tid and tid+32). No continue, no unroll —
-    // keep the control flow simple so correctness bugs are easy to spot.
     for (int slot_iter = 0; slot_iter < 2; ++slot_iter) {
         const int slot = tid + slot_iter * 32;
         const int tok  = page_offset + slot;
 
         if (tok < seq_len) {
-            // Per-slot FP32 scale (4 bytes at scale section).
             float scale;
-            std::memcpy(&scale, page_base + kScaleSectionOff + slot * 4, sizeof(float));
+            std::memcpy(&scale, k_smem + kScaleSectionOff + slot * 4, sizeof(float));
 
-            const uint8_t* kv_ptr = page_base + slot * kHeadDim;
+            const uint8_t* kv_ptr = k_smem + slot * kHeadDim;
 
             float acc = 0.0f;
             for (int h = 0; h < kNumHeads; ++h) {
@@ -125,24 +177,22 @@ __global__ void scoring_kernel_phase2a(
     }
 }
 
-}  // anonymous namespace
+}  // namespace
 
 // -----------------------------------------------------------------------------
 // Host entry (pybind).
 // -----------------------------------------------------------------------------
 
-void scoring_phase2a(
-    torch::Tensor q_u8,          // [B, 64, 128]               uint8 view of fp8_e4m3
-    torch::Tensor k_u8,          // [num_pages, 64, 1, 132]    uint8 view of int8
-    torch::Tensor weights,       // [B, 64]                    float32
-    torch::Tensor seq_lens,      // [B]                        int32
-    torch::Tensor block_table,   // [B, max_num_pages]         int32
-    torch::Tensor logits         // [B, max_num_pages*64]      float32 (caller preinits to -inf)
+void scoring_phase2b(
+    torch::Tensor q_u8,
+    torch::Tensor k_u8,
+    torch::Tensor weights,
+    torch::Tensor seq_lens,
+    torch::Tensor block_table,
+    torch::Tensor logits
 ) {
-    TORCH_CHECK(q_u8.is_cuda() && q_u8.scalar_type() == torch::kUInt8,
-                "q_u8 must be uint8 CUDA tensor");
-    TORCH_CHECK(k_u8.is_cuda() && k_u8.scalar_type() == torch::kUInt8,
-                "k_u8 must be uint8 CUDA tensor");
+    TORCH_CHECK(q_u8.is_cuda() && q_u8.scalar_type() == torch::kUInt8);
+    TORCH_CHECK(k_u8.is_cuda() && k_u8.scalar_type() == torch::kUInt8);
     TORCH_CHECK(weights.is_cuda() && weights.scalar_type() == torch::kFloat32);
     TORCH_CHECK(seq_lens.is_cuda() && seq_lens.scalar_type() == torch::kInt32);
     TORCH_CHECK(block_table.is_cuda() && block_table.scalar_type() == torch::kInt32);
@@ -150,18 +200,16 @@ void scoring_phase2a(
 
     const int batch_size    = q_u8.size(0);
     const int max_num_pages = block_table.size(1);
-    TORCH_CHECK(q_u8.size(1) == kNumHeads,         "num_heads must be 64");
-    TORCH_CHECK(q_u8.size(2) == kHeadDim,          "head_dim must be 128");
-    TORCH_CHECK(k_u8.size(1) == kPageSize,         "page_size must be 64");
-    TORCH_CHECK(k_u8.size(3) == kHeadDimWithScale, "head_dim_with_scale must be 132");
-    TORCH_CHECK(block_table.size(0) == batch_size);
-    TORCH_CHECK(logits.size(0) == batch_size);
+    TORCH_CHECK(q_u8.size(1) == kNumHeads);
+    TORCH_CHECK(q_u8.size(2) == kHeadDim);
+    TORCH_CHECK(k_u8.size(1) == kPageSize);
+    TORCH_CHECK(k_u8.size(3) == kHeadDimWithScale);
     TORCH_CHECK(logits.size(1) == max_num_pages * kPageSize);
 
     const dim3 grid(max_num_pages, batch_size);
     const dim3 block(32);
 
-    scoring_kernel_phase2a<<<grid, block>>>(
+    scoring_kernel_phase2b<<<grid, block>>>(
         q_u8.data_ptr<uint8_t>(),
         k_u8.data_ptr<uint8_t>(),
         weights.data_ptr<float>(),
@@ -172,10 +220,10 @@ void scoring_phase2a(
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess,
-                "scoring_kernel_phase2a launch failed: ", cudaGetErrorString(err));
+                "scoring_kernel_phase2b launch failed: ", cudaGetErrorString(err));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("scoring_phase2a", &scoring_phase2a,
-          "Phase 2a indexer scoring: naive FP32 FMA, single warp per page");
+    m.def("scoring_phase2b", &scoring_phase2b,
+          "Phase 2b indexer scoring: cp.async.bulk TMA K-load + FP32 FMA compute");
 }
