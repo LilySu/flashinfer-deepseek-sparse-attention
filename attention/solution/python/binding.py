@@ -19,7 +19,7 @@ from torch.utils.cpp_extension import load
 
 HERE = Path(__file__).resolve().parent
 
-_BACKEND = os.environ.get("DSA_ATTN_BACKEND", "python")  # "python" | "cuda"
+_BACKEND = os.environ.get("DSA_ATTN_BACKEND", "cuda")  # "python" | "cuda"
 _MODULE = None
 _BUILD_FAILED = False
 
@@ -45,7 +45,7 @@ def _build():
         extra_inc.append(cutlass)
     try:
         _MODULE = load(
-            name="dsa_sparse_attention_phase5a",
+            name="dsa_sparse_attention_phase5b",
             sources=[str(HERE / "kernel.cu")],
             extra_include_paths=extra_inc,
             extra_cuda_cflags=[
