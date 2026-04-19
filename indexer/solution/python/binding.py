@@ -173,23 +173,37 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
             max_num_pages,
         )
 
-    # Stage B (PyTorch; to be replaced by CUDA topk in Phase 3):
-    # per-batch topk with actual_topk = min(K, seq_len), then local→global remap.
-    topk_indices = torch.full((B, kTopK), -1, dtype=torch.int32, device=device)
-    for b in range(B):
-        seq_len = int(seq_lens[b].item())
-        if seq_len == 0:
-            continue
-        actual_topk = min(kTopK, seq_len)
-        valid = logits[b, :seq_len]
-        _, idx = torch.topk(valid, actual_topk)
+    # Stage B — vectorized PyTorch topk + remap (Phase 3). No per-batch
+    # device→host syncs; single torch.topk over [B, max_seq_len_kv] and
+    # vectorized gather for the local→global index conversion.
+    #
+    # torch.topk requires k ≤ dim size, but many workloads have
+    # max_seq_len_kv < kTopK (2048). Clamp to the available size and pad
+    # the output to kTopK with -1.
+    actual_k = min(kTopK, max_seq_len_kv)
+    top_vals, local_idx = torch.topk(logits, actual_k, dim=1)  # [B, actual_k]
 
-        bt_b = block_table[b].to(torch.long)
-        page_local = (idx // kPageSize).to(torch.long)
-        offset = idx % kPageSize
-        global_page = bt_b[page_local]
-        topk_tokens = (global_page * kPageSize + offset).to(torch.int32)
+    page_local_idx = local_idx // kPageSize
+    offset = (local_idx % kPageSize).to(torch.int32)
 
-        topk_indices[b, :actual_topk] = topk_tokens
+    bt_long = block_table.to(torch.long)
+    global_page = torch.gather(bt_long, 1, page_local_idx)
+    topk_tokens = (global_page.to(torch.int32) * kPageSize + offset)
+
+    # Positions where top_vals is -inf correspond to out-of-sequence padding
+    # → map to -1 sentinel.
+    topk_tokens = torch.where(
+        torch.isinf(top_vals),
+        torch.full_like(topk_tokens, -1),
+        topk_tokens,
+    )
+
+    if actual_k < kTopK:
+        pad = torch.full(
+            (B, kTopK - actual_k), -1, dtype=torch.int32, device=device,
+        )
+        topk_indices = torch.cat([topk_tokens, pad], dim=1)
+    else:
+        topk_indices = topk_tokens
 
     return (topk_indices,)
