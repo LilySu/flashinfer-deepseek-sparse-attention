@@ -173,9 +173,21 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
             max_num_pages,
         )
 
-    # Stage B — vectorized PyTorch topk + remap (Phase 3). No per-batch
-    # device→host syncs; single torch.topk over [B, max_seq_len_kv] and
-    # vectorized gather for the local→global index conversion.
+    # Stage B — vectorized PyTorch topk + remap (Phase 3).
+    #
+    # Phase 3b (custom CUDA radix-select topk) was evaluated and not shipped:
+    # torch.topk internally dispatches to a well-tuned cub-based block topk.
+    # Benchmarking Phase 3 vs hand-rolled cub paths showed parity or regress
+    # on our workload distribution (many short rows where torch's short-row
+    # fast path dominates, few long rows). Custom CUDA radix-select is the
+    # right call only if the scoring kernel is itself rewritten to fuse
+    # topk inline and avoid materializing the [B, max_seq_len_kv] logits
+    # tensor — that's a fusion problem, not a topk problem, and is a
+    # candidate for a future "Phase 2d" fused scoring+topk kernel.
+    #
+    # No per-batch device→host syncs; single torch.topk over
+    # [B, max_seq_len_kv] and vectorized gather for the local→global
+    # index conversion.
     #
     # torch.topk requires k ≤ dim size, but many workloads have
     # max_seq_len_kv < kTopK (2048). Clamp to the available size and pad
