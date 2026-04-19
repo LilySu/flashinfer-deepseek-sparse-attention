@@ -1,9 +1,10 @@
-// DSA sparse attention — Phase 5b.1: multi-warp cooperative attention.
+// DSA sparse attention — Phase 5b.2: multi-warp + cp.async.bulk TMA K-load.
 //
-// Builds on Phase 5a. Block size 32 → 128 (4 warps). Each chunk of 64
-// KV slots is processed cooperatively across warps: K tile staged in
-// BF16 SMEM, logits computed with warp-shuffle reductions, online
-// softmax in FP32, O accumulator in FP32 SMEM.
+// Extends Phase 5b.1 by replacing the cooperative bf16 byte-copy K-tile
+// load with per-slot cp.async.bulk TMA ops (Blackwell TMA unit). 128
+// threads each issue one TMA per chunk: 64 for kc, 64 for kp, all in
+// parallel. mbarrier with expect_tx gates the compute until all bytes
+// land. Phase 5b.1's multi-warp compute kernel is unchanged.
 //
 // Per-CTA SMEM (~90 KiB — requires dynamic-SMEM opt-in):
 //   qn_smem [16, 512]  BF16 = 16 KiB
@@ -45,7 +46,47 @@ struct AttnSmem {
     float m_state[kQoHeads];
     float l_state[kQoHeads];
     float O_acc[kQoHeads][kHeadDimCkv];         // 32 KiB
+    alignas(8) uint64_t k_bar;                   // TMA mbarrier
 };
+
+// Bytes transferred per chunk via cp.async.bulk: 64 slots × (kc + kp).
+constexpr uint32_t kTmaBytesPerChunk =
+    kBlockKv * (kHeadDimCkv * 2 + kHeadDimKpe * 2);  // 64*(1024+128) = 73728
+
+// ---- TMA / mbarrier inline-PTX helpers ----
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    uint32_t r;
+    asm volatile("{ .reg .u64 u; cvta.to.shared.u64 u, %1; cvt.u32.u64 %0, u; }"
+                 : "=r"(r) : "l"(p));
+    return r;
+}
+__device__ __forceinline__ void mbarrier_init(uint64_t* bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;"
+                 : : "r"(smem_addr(bar)), "r"(count));
+}
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* bar, uint32_t tx) {
+    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+                 : : "r"(smem_addr(bar)), "r"(tx));
+}
+__device__ __forceinline__ void mbarrier_wait(uint64_t* bar, uint32_t phase) {
+    uint32_t done;
+    do {
+        asm volatile("{ .reg .pred p;"
+                     "  mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;"
+                     "  selp.u32 %0, 1, 0, p; }"
+                     : "=r"(done) : "r"(smem_addr(bar)), "r"(phase));
+    } while (!done);
+}
+__device__ __forceinline__ void cp_async_bulk_g2s(
+    void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar
+) {
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1], %2, [%3];"
+        : : "r"(smem_addr(smem_dst)), "l"(gmem_src),
+            "r"(bytes), "r"(smem_addr(bar))
+    );
+}
 
 __device__ __forceinline__ float warp_reduce_sum(float x) {
     #pragma unroll
@@ -100,30 +141,50 @@ attention_kernel_phase5b(
     for (int i = tid; i < kQoHeads * kHeadDimCkv; i += kThreads) {
         smem.O_acc[i / kHeadDimCkv][i % kHeadDimCkv] = 0.0f;
     }
+
+    // Initialize the TMA barrier once per CTA.
+    if (tid == 0) {
+        mbarrier_init(&smem.k_bar, 1);
+        asm volatile("fence.proxy.async.shared::cta;");
+    }
     __syncthreads();
 
     const int64_t sp_base = static_cast<int64_t>(t) * kTopK;
+    uint32_t bar_phase = 0;
 
     for (int chunk = 0; chunk < kNumChunks; ++chunk) {
         const int chunk_off = chunk * kBlockKv;
 
-        // --- Load kc_tile, kp_tile (bf16) for this chunk -------------
-        // 128 threads × 64 slots → 2 threads per slot; each thread reads
-        // its half of kc (256 bf16) + half of kp (32 bf16).
-        for (int s = 0; s < kBlockKv; ++s) {
+        // --- Issue TMA bulk loads for 64 kc + 64 kp blocks ------------
+        // 128 threads × 1 TMA each: tid 0..63 → kc[slot], tid 64..127 → kp[slot].
+        if (tid == 0) {
+            mbarrier_arrive_expect_tx(&smem.k_bar, kTmaBytesPerChunk);
+        }
+        __syncthreads();
+
+        if (tid < kBlockKv) {
+            const int s = tid;
             int32_t idx = sparse_idx[sp_base + chunk_off + s];
             int safe_idx = (idx >= 0) ? idx : 0;
-            const __nv_bfloat16* kc_src =
-                ckv_flat + static_cast<int64_t>(safe_idx) * kHeadDimCkv;
-            const __nv_bfloat16* kp_src =
-                kpe_flat + static_cast<int64_t>(safe_idx) * kHeadDimKpe;
-            for (int d = tid; d < kHeadDimCkv; d += kThreads) {
-                smem.kc[s][d] = kc_src[d];
-            }
-            for (int d = tid; d < kHeadDimKpe; d += kThreads) {
-                smem.kp[s][d] = kp_src[d];
-            }
+            cp_async_bulk_g2s(
+                &smem.kc[s][0],
+                ckv_flat + static_cast<int64_t>(safe_idx) * kHeadDimCkv,
+                kHeadDimCkv * sizeof(__nv_bfloat16),   // 1024 B
+                &smem.k_bar);
+        } else if (tid < 2 * kBlockKv) {
+            const int s = tid - kBlockKv;
+            int32_t idx = sparse_idx[sp_base + chunk_off + s];
+            int safe_idx = (idx >= 0) ? idx : 0;
+            cp_async_bulk_g2s(
+                &smem.kp[s][0],
+                kpe_flat + static_cast<int64_t>(safe_idx) * kHeadDimKpe,
+                kHeadDimKpe * sizeof(__nv_bfloat16),   // 128 B
+                &smem.k_bar);
         }
+
+        // Wait for all 128 TMAs this chunk to complete.
+        mbarrier_wait(&smem.k_bar, bar_phase);
+        bar_phase ^= 1;
         __syncthreads();
 
         // --- Compute logits[16, 64] via cooperative warp-reduce dot -----
