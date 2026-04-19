@@ -1,13 +1,16 @@
 """DSA sparse attention entry point.
 
-Two paths are wired up:
-  - Default: chunk-vectorized PyTorch (batched torch.bmm). Fast for this
-    problem shape; used by the submission.
-  - Opt-in: Phase 5a naive single-warp CUDA kernel (online softmax).
-    Correct (23/23 PASSED) but ~4x slower than the vectorized path on
-    B200 due to no warp-level parallelism, no TMA, no tensor cores. Kept
-    as the base that Phase 5b/5c/5d would layer on. Activate by setting
-    env var DSA_ATTN_BACKEND=cuda.
+Two paths are wired up, CUDA is the default:
+  - Default (cuda): Phase 5b.3 CUDA kernel — 4-warp cooperative + TMA
+    K-load + mma.sync.m16n8k16 BF16 tensor cores for QK. 23/23 PASSED,
+    ~2.86x mean speedup vs contest reference (beats Python 2.01x).
+  - Opt-in (python): chunk-vectorized batched torch.bmm reference. Set
+    DSA_ATTN_BACKEND=python to activate.
+
+Phase 5c (sort/coalesce) experiments both regressed (in-kernel bitonic
+sort added 1344 syncthreads/token; Python-side torch.sort overhead
+outweighed the marginal DRAM-locality gain for our workload
+distribution). Kept 5b.3 as the shipping CUDA path.
 """
 
 import math
@@ -19,7 +22,7 @@ from torch.utils.cpp_extension import load
 
 HERE = Path(__file__).resolve().parent
 
-_BACKEND = os.environ.get("DSA_ATTN_BACKEND", "cuda")  # "python" | "cuda" (temp cuda for 5b.3 testing)
+_BACKEND = os.environ.get("DSA_ATTN_BACKEND", "cuda")  # "python" | "cuda"
 _MODULE = None
 _BUILD_FAILED = False
 
