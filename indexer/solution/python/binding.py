@@ -20,6 +20,16 @@ kPageSize = 64
 kTopK = 2048
 
 _MODULE = None
+_MODULE_2D = None
+
+# Force-enable Phase 2d for testing via env var. In production, use
+# _should_use_2d() heuristic below.
+# Phase 2d explored but reverted — bounded-merge algorithm has a set-correctness
+# bug when pending values exceed frozen threshold_top1984. Fix requires full
+# 4096-pad sort per page (~36 cross-warp syncs, ~1.8ms for long-seq rows), which
+# is slower than 2c's DRAM round-trip (~64µs). See kernel_2d.cu comment for
+# full diagnosis. binding routes to 2c on all shapes.
+_FORCE_2D = os.environ.get("USE_PHASE_2D", "0")  # "1" / "0" / "auto"
 
 
 def _cutlass_include_dir():
@@ -31,6 +41,20 @@ def _cutlass_include_dir():
         return str(p) if p.exists() else None
     except ImportError:
         return None
+
+
+_COMMON_NVCC_FLAGS = [
+    "-arch=sm_100a",
+    "-std=c++17",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-O3",
+    "--use_fast_math",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+]
 
 
 def _build():
@@ -45,22 +69,43 @@ def _build():
         name="dsa_topk_indexer_phase2c",
         sources=[str(HERE / "kernel.cu")],
         extra_include_paths=extra_inc,
-        extra_cuda_cflags=[
-            "-arch=sm_100a",
-            "-std=c++17",
-            "--expt-relaxed-constexpr",
-            "--expt-extended-lambda",
-            "-O3",
-            "--use_fast_math",
-            "-U__CUDA_NO_HALF_OPERATORS__",
-            "-U__CUDA_NO_HALF_CONVERSIONS__",
-            "-U__CUDA_NO_HALF2_OPERATORS__",
-            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        ],
+        extra_cuda_cflags=_COMMON_NVCC_FLAGS,
         extra_cflags=["-std=c++17", "-O3"],
         verbose=False,
     )
     return _MODULE
+
+
+def _build_2d():
+    global _MODULE_2D
+    if _MODULE_2D is not None:
+        return _MODULE_2D
+    extra_inc = []
+    cutlass = _cutlass_include_dir()
+    if cutlass:
+        extra_inc.append(cutlass)
+    _MODULE_2D = load(
+        name="dsa_topk_indexer_phase2d",
+        sources=[str(HERE / "kernel_2d.cu")],
+        extra_include_paths=extra_inc,
+        extra_cuda_cflags=_COMMON_NVCC_FLAGS,
+        extra_cflags=["-std=c++17", "-O3"],
+        verbose=False,
+    )
+    return _MODULE_2D
+
+
+def _should_use_2d(B, max_seq_len_kv, sum_seq_lens):
+    """Dispatch heuristic (placeholder — will be tuned after benchmark).
+    2d wins when DRAM round-trip is large (large output logits tensor) AND
+    SM fill from B CTAs is non-trivial.
+    """
+    if _FORCE_2D == "1":
+        return True
+    if _FORCE_2D == "0":
+        return False
+    # Heuristic: require both B and total work to be non-trivial for 2d.
+    return B >= 8 and max_seq_len_kv >= 4096 and sum_seq_lens >= 32768
 
 
 @torch.no_grad()
@@ -147,11 +192,27 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
         (topk_indices,)
         topk_indices: [B, 2048] int32; -1 marks padding when seq_len < 2048.
     """
-    mod = _build()
     B = q_index_fp8.shape[0]
     max_num_pages = block_table.shape[1]
     max_seq_len_kv = max_num_pages * kPageSize
     device = q_index_fp8.device
+
+    # --- Dispatch: Phase 2d (fused scoring+topk) for shapes where it wins --
+    # Skip the .item() sync entirely unless 2d is in play.
+    if _FORCE_2D != "0" and _should_use_2d(
+        B, max_seq_len_kv, int(seq_lens.sum().item())
+    ):
+        mod2d = _build_2d()
+        q_u8 = q_index_fp8.view(torch.uint8)
+        k_u8 = k_index_cache_fp8.view(torch.uint8)
+        topk_indices = torch.full((B, kTopK), -1, dtype=torch.int32, device=device)
+        # Telemetry disabled on production path (empty tensor = skip).
+        skip_counts = torch.empty(0, dtype=torch.int32, device=device)
+        mod2d.fused_phase2d(q_u8, k_u8, weights, seq_lens, block_table,
+                            topk_indices, skip_counts)
+        return (topk_indices,)
+
+    mod = _build()
 
     # Pre-init to -inf so any slot the kernel skips stays as padding.
     logits = torch.full(
