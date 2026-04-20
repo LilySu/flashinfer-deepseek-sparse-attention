@@ -54,7 +54,7 @@ image = (
     timeout=1800,
     volumes={"/data": trace_volume, "/ncu_reports": ncu_volume},
 )
-def run_ncu() -> dict:
+def run_ncu(kernel_kind: str = "indexer") -> dict:
     import subprocess
     import torch
     from pathlib import Path as P
@@ -88,9 +88,9 @@ for _ in range(6):
     out = binding.kernel(q, k, w, sl, bt)
 torch.cuda.synchronize()
 print("indexer kernel executed")
-''' if KERNEL == 'indexer' else '''
-T = 16
-num_pages = 128
+''' if kernel_kind == 'indexer' else '''
+T = 256
+num_pages = 1024
 qn = torch.randn(T, 16, 512, dtype=torch.bfloat16, device=device)
 qp = torch.randn(T, 16, 64,  dtype=torch.bfloat16, device=device)
 ckv = torch.randn(num_pages, 64, 512, dtype=torch.bfloat16, device=device)
@@ -106,12 +106,12 @@ print("attention kernel executed")
 """)
 
     # 3) Run under NCU: Pass-1 triage — LaunchStats + SpeedOfLight + Occupancy only.
-    report_path = f"/ncu_reports/{KERNEL}_phase6_triage.ncu-rep"
+    report_path = f"/ncu_reports/{kernel_kind}_phase6_triage.ncu-rep"
     # Filter to our actual kernel (scoring_kernel_phase2c for indexer,
     # attention_kernel_phase5a for attention). Without this, NCU picks up
     # torch's internal vectorized_elementwise_kernel from preinit ops.
     kernel_regex = (
-        "scoring_kernel_phase" if KERNEL == "indexer"
+        "scoring_kernel_phase" if kernel_kind == "indexer"
         else "attention_kernel_phase"
     )
     cmd = [
@@ -140,7 +140,7 @@ print("attention kernel executed")
     print(result.stderr[:4000])
 
     # 4) Summary CSV dump from the .ncu-rep.
-    csv_path = f"/ncu_reports/{KERNEL}_phase6_triage.csv"
+    csv_path = f"/ncu_reports/{kernel_kind}_phase6_triage.csv"
     subprocess.run(
         ["/usr/local/cuda/bin/ncu", "--import", report_path, "--csv",
          "--page", "details"],
@@ -157,7 +157,7 @@ print("attention kernel executed")
 
 @app.local_entrypoint()
 def main():
-    r = run_ncu.remote()
+    r = run_ncu.remote(KERNEL)
     print("\n=== RESULT ===")
     print(r)
     print("\nTo download report:")
