@@ -1,9 +1,13 @@
-// DSA sparse attention — Phase 5b.3: add mma.sync tensor cores for QK.
+// DSA sparse attention — Phase 5b.3 + A1: tensor cores for QK AND AV.
 //
-// Extends Phase 5b.2 by replacing the scalar FP32 FMA QK computation
-// with warp-level mma.sync.m16n8k16 BF16 tensor-core instructions. Q
-// and K are concatenated in SMEM as [16, 576] and [64, 576] so one
-// unified mma-loop covers both the ckv and kpe dot products.
+// Extends Phase 5b.3 by replacing the scalar FP32 FMA AV computation
+// with warp-level mma.sync.m16n8k16 BF16 tensor cores. After softmax
+// the FP32 attention probabilities are converted to BF16 in a dedicated
+// SMEM buffer (attn_bf16) and combined with the ckv half of k_concat
+// via M=16, N=8, K=16 mma.sync shapes.
+//
+// Per warp: N-tiles = 128 dims / 8 = 16, K-tiles = 64 slots / 16 = 4,
+// so 16 × 4 = 64 AV mma.sync calls per warp per chunk.
 //
 // Per-warp work:
 //   N = 64 slots  → split into 4 warps × 16 slots = 2 N-tiles of 8 per warp
@@ -51,12 +55,18 @@ constexpr int kKTiles     = kQKDim / 16;            // 36
 struct AttnSmem {
     __nv_bfloat16 q_concat[kQoHeads][kQKDim];     // [16, 576] = 18 KiB  (qn || qp)
     __nv_bfloat16 k_concat[kBlockKv][kQKDim];     // [64, 576] = 72 KiB  (ckv || kpe)
-    float  logits[kQoHeads][kBlockKv];            // 4 KiB
+    float  logits[kQoHeads][kBlockKv];            // 4 KiB — FP32 attn after softmax
+    __nv_bfloat16 attn_bf16[kQoHeads][kBlockKv];  // 2 KiB — BF16 cast for mma.sync AV
     float  m_state[kQoHeads];
     float  l_state[kQoHeads];
     float  O_acc[kQoHeads][kHeadDimCkv];          // 32 KiB
     alignas(8) uint64_t k_bar;
 };
+
+// AV constants (N=512 dims split across 4 warps = 128 dims/warp = 16 N-tiles).
+constexpr int kAVDimsPerWarp  = kHeadDimCkv / kWarps;    // 128
+constexpr int kAVNTilesPerWarp = kAVDimsPerWarp / 8;      // 16
+constexpr int kAVKTiles       = kBlockKv / 16;             // 4
 
 constexpr uint32_t kTmaBytesPerChunk =
     kBlockKv * (kHeadDimCkv * 2 + kHeadDimKpe * 2);  // 73728
@@ -121,6 +131,16 @@ __device__ __forceinline__ uint32_t
 load_bf16_pair(const __nv_bfloat16* smem, int stride, int row, int col) {
     const __nv_bfloat16* p = smem + row * stride + col;
     return *reinterpret_cast<const uint32_t*>(p);
+}
+
+// Pack two BF16 values from arbitrary memory locations into a single uint32
+// with lo in bits [0..15] and hi in bits [16..31]. Needed for mma.sync B
+// col-major when the row-pair spans non-adjacent SMEM bytes (i.e., AV where
+// B[k, n] = k_concat[slot=k, dim=n] and the pair crosses slots, stride 576).
+__device__ __forceinline__ uint32_t pack_bf16_pair(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    uint16_t lo16 = *reinterpret_cast<uint16_t*>(&lo);
+    uint16_t hi16 = *reinterpret_cast<uint16_t*>(&hi);
+    return static_cast<uint32_t>(lo16) | (static_cast<uint32_t>(hi16) << 16);
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float x) {
@@ -310,18 +330,97 @@ attention_kernel_phase5b(
         }
         __syncthreads();
 
-        // --- O = O * rescale + Σ_s logits[h, s] * k_concat[s, d]  (d < 512) ---
-        for (int i = tid; i < kQoHeads * kHeadDimCkv; i += kThreads) {
-            const int h = i / kHeadDimCkv;
-            const int d = i % kHeadDimCkv;
-            const float rs = rescale_smem[h];
-            float acc_o = smem.O_acc[h][d] * rs;
-            for (int s = 0; s < kBlockKv; ++s) {
-                const float e = smem.logits[h][s];
-                const float kv = __bfloat162float(smem.k_concat[s][d]);
-                acc_o += e * kv;
+        // --- A1: cast FP32 attn probabilities to BF16 for mma.sync AV ---
+        for (int i = tid; i < kQoHeads * kBlockKv; i += kThreads) {
+            const int h = i / kBlockKv;
+            const int s = i % kBlockKv;
+            smem.attn_bf16[h][s] = __float2bfloat16(smem.logits[h][s]);
+        }
+        __syncthreads();
+
+        // --- AV via mma.sync.m16n8k16 BF16 tensor cores -----------------
+        // Per warp owns 128 of the 512 output dims: warp w covers dims
+        // [w*128, w*128+128). 16 N-tiles of 8 dims × 4 K-tiles of 16 slots.
+        const int dim_base_for_warp = wid * kAVDimsPerWarp;
+
+        float av_acc[kAVNTilesPerWarp][4];
+        #pragma unroll
+        for (int nt = 0; nt < kAVNTilesPerWarp; ++nt) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) av_acc[nt][j] = 0.0f;
+        }
+
+        // Loop K (slot) in tiles of 16.
+        #pragma unroll
+        for (int kt = 0; kt < kAVKTiles; ++kt) {
+            const int k_slot_base = kt * 16;
+
+            // ---- Load A fragment from attn_bf16[16 heads, kt_slots*16] ----
+            // A row-major; pair across K (slot) axis → contiguous in attn_bf16
+            // (row stride = kBlockKv = 64 bf16). Use load_bf16_pair.
+            const int a_row0 = lane / 4;
+            const int a_row1 = a_row0 + 8;
+            const int a_colA = (lane & 3) * 2;
+            const int a_colB = a_colA + 8;
+            const uint32_t a0 = load_bf16_pair(&smem.attn_bf16[0][0], kBlockKv,
+                                                a_row0, k_slot_base + a_colA);
+            const uint32_t a1 = load_bf16_pair(&smem.attn_bf16[0][0], kBlockKv,
+                                                a_row1, k_slot_base + a_colA);
+            const uint32_t a2 = load_bf16_pair(&smem.attn_bf16[0][0], kBlockKv,
+                                                a_row0, k_slot_base + a_colB);
+            const uint32_t a3 = load_bf16_pair(&smem.attn_bf16[0][0], kBlockKv,
+                                                a_row1, k_slot_base + a_colB);
+
+            // ---- For each N-tile (8 output dims), load B + mma ----
+            // B [K=16 slots, N=8 dims]. B[k_row, n_col] = k_concat[k_slot_base + k_row, dim_base + n_col].
+            // In row-major k_concat, pair-across-rows (K axis) is stride kQKDim → NOT adjacent,
+            // so use pack_bf16_pair with 2 separate loads per reg.
+            const int row_k_base = 2 * (lane & 3);  // 0, 2, 4, 6
+            #pragma unroll
+            for (int nt = 0; nt < kAVNTilesPerWarp; ++nt) {
+                const int n_base = dim_base_for_warp + nt * 8;
+                const int dim_col = n_base + (lane / 4);  // 0..7 within 8-col tile
+
+                const __nv_bfloat16 b00 =
+                    smem.k_concat[k_slot_base + row_k_base + 0][dim_col];
+                const __nv_bfloat16 b01 =
+                    smem.k_concat[k_slot_base + row_k_base + 1][dim_col];
+                const __nv_bfloat16 b10 =
+                    smem.k_concat[k_slot_base + row_k_base + 8][dim_col];
+                const __nv_bfloat16 b11 =
+                    smem.k_concat[k_slot_base + row_k_base + 9][dim_col];
+                const uint32_t b0 = pack_bf16_pair(b00, b01);
+                const uint32_t b1 = pack_bf16_pair(b10, b11);
+
+                mma_m16n8k16_bf16_f32(a0, a1, a2, a3,
+                                      b0, b1,
+                                      av_acc[nt][0], av_acc[nt][1],
+                                      av_acc[nt][2], av_acc[nt][3]);
             }
-            smem.O_acc[h][d] = acc_o;
+        }
+
+        // --- Rescale existing O_acc and add AV contribution ---------------
+        // D layout per lane (same as QK D): rows {lane/4, lane/4+8} ×
+        // cols {lane%4*2, lane%4*2+1}, so each lane writes 4 (h, d) entries
+        // per N-tile. Warps own disjoint dim ranges → no cross-warp race;
+        // within warp each (h, d) is owned by exactly one lane.
+        #pragma unroll
+        for (int nt = 0; nt < kAVNTilesPerWarp; ++nt) {
+            const int n_base = dim_base_for_warp + nt * 8;
+            const int d_col0 = n_base + (lane & 3) * 2;
+            const int d_col1 = d_col0 + 1;
+            const int d_row0 = lane / 4;
+            const int d_row1 = d_row0 + 8;
+            const float rs0 = rescale_smem[d_row0];
+            const float rs1 = rescale_smem[d_row1];
+            smem.O_acc[d_row0][d_col0] =
+                smem.O_acc[d_row0][d_col0] * rs0 + av_acc[nt][0];
+            smem.O_acc[d_row0][d_col1] =
+                smem.O_acc[d_row0][d_col1] * rs0 + av_acc[nt][1];
+            smem.O_acc[d_row1][d_col0] =
+                smem.O_acc[d_row1][d_col0] * rs1 + av_acc[nt][2];
+            smem.O_acc[d_row1][d_col1] =
+                smem.O_acc[d_row1][d_col1] * rs1 + av_acc[nt][3];
         }
         __syncthreads();
     }
