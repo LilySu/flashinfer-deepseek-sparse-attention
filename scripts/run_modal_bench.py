@@ -186,6 +186,12 @@ def main():
             print(f"  min:    {min(speedups):.3f}x")
             print(f"  max:    {max(speedups):.3f}x")
 
+        # Per-workload dump for variance analysis. Order matches bench order.
+        print("\n--- per-workload (index, speedup) ---")
+        for i, t in enumerate(result["traces"]):
+            if "speedup" in t:
+                print(f"  [{i:02d}] {t['speedup']:.4f}x")
+
     # Print first 5 non-PASSED traces for diagnosis
     failed = [t for t in result["traces"] if t["status"] != "PASSED"]
     if failed:
