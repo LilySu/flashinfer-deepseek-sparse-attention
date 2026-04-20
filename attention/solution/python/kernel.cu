@@ -1,4 +1,19 @@
-// DSA sparse attention — Phase 5b.3 + A1: tensor cores for QK AND AV.
+// DSA sparse attention — Phase 5b.3 + A1 + Step 2a: 2-stage K pipeline.
+//
+// Builds on 5b.3 + A1 by double-buffering k_concat across 2 stages so
+// that TMA for chunk c+1 overlaps compute for chunk c. Option B′:
+// thread-parallel double-buffer — all 4 warps continue to do compute on
+// the active stage; TMA issuance remains data-parallel across 128
+// threads, with a single `arrive.expect_tx` from tid==0 per stage cycle.
+//
+// Pipeline (kNumStages=2):
+//   Prologue: init full[0], full[1]; issue TMA chunk 0→stage 0, chunk 1→stage 1.
+//   Loop chunk = 0..N-1:
+//     stage = chunk & 1;  phase = (chunk >> 1) & 1
+//     wait full[stage] phase;  compute on stage
+//     if (chunk + kNumStages < N): re-issue TMA for chunk+2 → stage
+// Total TMA issuances per block: 2 + (N-2) = N = kNumChunks. Debug build
+// asserts this at kernel exit.
 //
 // Extends Phase 5b.3 by replacing the scalar FP32 FMA AV computation
 // with warp-level mma.sync.m16n8k16 BF16 tensor cores. After softmax
@@ -33,6 +48,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <torch/extension.h>
+#include <cassert>
 #include <cstdint>
 #include <cmath>
 
@@ -45,6 +61,10 @@ constexpr int kQKDim      = kHeadDimCkv + kHeadDimKpe;   // 576
 constexpr int kTopK       = 2048;
 constexpr int kBlockKv    = 64;
 constexpr int kNumChunks  = kTopK / kBlockKv;   // 32
+constexpr int kNumStages  = 2;
+
+static_assert(kNumChunks >= kNumStages,
+    "Pipeline requires at least kNumStages chunks");
 
 constexpr int kThreads    = 128;
 constexpr int kWarps      = 4;
@@ -53,15 +73,34 @@ constexpr int kNTilesPerWarp = kSlotsPerWarp / 8;  // 2
 constexpr int kKTiles     = kQKDim / 16;            // 36
 
 struct AttnSmem {
-    __nv_bfloat16 q_concat[kQoHeads][kQKDim];     // [16, 576] = 18 KiB  (qn || qp)
-    __nv_bfloat16 k_concat[kBlockKv][kQKDim];     // [64, 576] = 72 KiB  (ckv || kpe)
-    float  logits[kQoHeads][kBlockKv];            // 4 KiB — FP32 attn after softmax
-    __nv_bfloat16 attn_bf16[kQoHeads][kBlockKv];  // 2 KiB — BF16 cast for mma.sync AV
+    __nv_bfloat16 q_concat[kQoHeads][kQKDim];                 // 18 KiB
+    __nv_bfloat16 k_concat[kNumStages][kBlockKv][kQKDim];     // 2 × 72 KiB
+    float  logits[kQoHeads][kBlockKv];                         // 4 KiB
+    __nv_bfloat16 attn_bf16[kQoHeads][kBlockKv];               // 2 KiB
     float  m_state[kQoHeads];
     float  l_state[kQoHeads];
-    float  O_acc[kQoHeads][kHeadDimCkv];          // 32 KiB
-    alignas(8) uint64_t k_bar;
+    float  O_acc[kQoHeads][kHeadDimCkv];                       // 32 KiB
+    alignas(8) uint64_t k_bar[kNumStages];
 };
+
+// Phase-bit helper for N=2-stage mbarrier pipeline with 0-init parity.
+//   stage(iter) = iter & 1
+//   phase(iter) = (iter >> 1) & 1
+// Worked example (N=2, 10 iters):
+//   iter  stage  phase   wait_on
+//    0      0      0     full[0] phase=0
+//    1      1      0     full[1] phase=0
+//    2      0      1     full[0] phase=1
+//    3      1      1     full[1] phase=1
+//    4      0      0     full[0] phase=0
+//    5      1      0     full[1] phase=0
+//    6      0      1     full[0] phase=1
+//    7      1      1     full[1] phase=1
+//    8      0      0     full[0] phase=0
+//    9      1      0     full[1] phase=0
+// Each stage's bar visits every 2 iters; parity flips on each visit.
+__device__ __forceinline__ uint32_t pipe_stage(int iter) { return iter & 1; }
+__device__ __forceinline__ uint32_t pipe_phase(int iter) { return (iter >> 1) & 1; }
 
 // AV constants (N=512 dims split across 4 warps = 128 dims/warp = 16 N-tiles).
 constexpr int kAVDimsPerWarp  = kHeadDimCkv / kWarps;    // 128
@@ -150,6 +189,47 @@ __device__ __forceinline__ float warp_reduce_sum(float x) {
     return x;
 }
 
+// Issues cp.async.bulk for one chunk into k_concat[stage].
+// Confirmation-2: exactly one thread (tid==0) calls arrive_expect_tx per
+// invocation. All 128 threads then participate in the cp.async.bulk data
+// transfers (each contributing bytes that decrement the barrier's tx
+// counter). Caller is responsible for eventually waiting via mbarrier_wait.
+__device__ __forceinline__ void issue_k_tma_for_chunk(
+    AttnSmem& smem,
+    int stage,
+    int chunk_off,
+    const int32_t* __restrict__ sparse_idx,
+    int64_t sp_base,
+    const __nv_bfloat16* __restrict__ ckv_flat,
+    const __nv_bfloat16* __restrict__ kpe_flat,
+    int tid
+) {
+    if (tid == 0) {
+        mbarrier_arrive_expect_tx(&smem.k_bar[stage], kTmaBytesPerChunk);
+    }
+    __syncthreads();  // expect_tx happens-before any cp.async.bulk
+
+    for (int i = tid; i < 2 * kBlockKv; i += kThreads) {
+        const bool is_kp = (i >= kBlockKv);
+        const int s = is_kp ? (i - kBlockKv) : i;
+        int32_t idx = sparse_idx[sp_base + chunk_off + s];
+        int safe_idx = (idx >= 0) ? idx : 0;
+        if (is_kp) {
+            cp_async_bulk_g2s(
+                &smem.k_concat[stage][s][kHeadDimCkv],
+                kpe_flat + static_cast<int64_t>(safe_idx) * kHeadDimKpe,
+                kHeadDimKpe * sizeof(__nv_bfloat16),
+                &smem.k_bar[stage]);
+        } else {
+            cp_async_bulk_g2s(
+                &smem.k_concat[stage][s][0],
+                ckv_flat + static_cast<int64_t>(safe_idx) * kHeadDimCkv,
+                kHeadDimCkv * sizeof(__nv_bfloat16),
+                &smem.k_bar[stage]);
+        }
+    }
+}
+
 __global__ void __launch_bounds__(kThreads, 1)
 attention_kernel_phase5b(
     const __nv_bfloat16* __restrict__ q_nope,     // [T, 16, 512]
@@ -192,45 +272,42 @@ attention_kernel_phase5b(
         smem.O_acc[i / kHeadDimCkv][i % kHeadDimCkv] = 0.0f;
     }
 
+    // Init both stage barriers before any TMA issue.
     if (tid == 0) {
-        mbarrier_init(&smem.k_bar, 1);
+        #pragma unroll
+        for (int s = 0; s < kNumStages; ++s) mbarrier_init(&smem.k_bar[s], 1);
         asm volatile("fence.proxy.async.shared::cta;");
     }
     __syncthreads();
 
+#ifndef NDEBUG
+    __shared__ int debug_tma_count;
+    if (tid == 0) debug_tma_count = 0;
+    __syncthreads();
+#endif
+
     const int64_t sp_base = static_cast<int64_t>(t) * kTopK;
-    uint32_t bar_phase = 0;
+
+    // Prologue: fill the first kNumStages stages. Each issue is guarded by
+    // s < kNumChunks so shapes with fewer chunks than stages are safe.
+    #pragma unroll
+    for (int s = 0; s < kNumStages; ++s) {
+        if (s < kNumChunks) {
+            issue_k_tma_for_chunk(smem, s, s * kBlockKv,
+                                  sparse_idx, sp_base, ckv_flat, kpe_flat, tid);
+#ifndef NDEBUG
+            if (tid == 0) debug_tma_count++;
+#endif
+        }
+    }
 
     for (int chunk = 0; chunk < kNumChunks; ++chunk) {
-        const int chunk_off = chunk * kBlockKv;
+        const int chunk_off  = chunk * kBlockKv;
+        const int stage      = pipe_stage(chunk);
+        const uint32_t phase = pipe_phase(chunk);
 
-        // --- TMA K load: 64 slots × (ckv[512] + kpe[64]) into k_concat -----
-        if (tid == 0) {
-            mbarrier_arrive_expect_tx(&smem.k_bar, kTmaBytesPerChunk);
-        }
-        __syncthreads();
-
-        for (int i = tid; i < 2 * kBlockKv; i += kThreads) {
-            const bool is_kp = (i >= kBlockKv);
-            const int s = is_kp ? (i - kBlockKv) : i;
-            int32_t idx = sparse_idx[sp_base + chunk_off + s];
-            int safe_idx = (idx >= 0) ? idx : 0;
-            if (is_kp) {
-                cp_async_bulk_g2s(
-                    &smem.k_concat[s][kHeadDimCkv],
-                    kpe_flat + static_cast<int64_t>(safe_idx) * kHeadDimKpe,
-                    kHeadDimKpe * sizeof(__nv_bfloat16),
-                    &smem.k_bar);
-            } else {
-                cp_async_bulk_g2s(
-                    &smem.k_concat[s][0],
-                    ckv_flat + static_cast<int64_t>(safe_idx) * kHeadDimCkv,
-                    kHeadDimCkv * sizeof(__nv_bfloat16),
-                    &smem.k_bar);
-            }
-        }
-        mbarrier_wait(&smem.k_bar, bar_phase);
-        bar_phase ^= 1;
+        // Wait for this stage's K to be fully delivered.
+        mbarrier_wait(&smem.k_bar[stage], phase);
         __syncthreads();
 
         // --- QK via mma.sync tensor cores ----------------------------------
@@ -270,9 +347,9 @@ attention_kernel_phase5b(
                 const int slot_col = slot_base_for_warp + nt * 8 + (lane / 4);
                 const int b_row_base = 2 * (lane & 3);
                 // B[k_row, n_col] = k_concat[slot_col, k_base + k_row]
-                const uint32_t b0 = load_bf16_pair(&smem.k_concat[0][0], kQKDim,
+                const uint32_t b0 = load_bf16_pair(&smem.k_concat[stage][0][0], kQKDim,
                                                     slot_col, k_base + b_row_base);
-                const uint32_t b1 = load_bf16_pair(&smem.k_concat[0][0], kQKDim,
+                const uint32_t b1 = load_bf16_pair(&smem.k_concat[stage][0][0], kQKDim,
                                                     slot_col, k_base + b_row_base + 8);
 
                 mma_m16n8k16_bf16_f32(a0, a1, a2, a3,
@@ -382,13 +459,13 @@ attention_kernel_phase5b(
                 const int dim_col = n_base + (lane / 4);  // 0..7 within 8-col tile
 
                 const __nv_bfloat16 b00 =
-                    smem.k_concat[k_slot_base + row_k_base + 0][dim_col];
+                    smem.k_concat[stage][k_slot_base + row_k_base + 0][dim_col];
                 const __nv_bfloat16 b01 =
-                    smem.k_concat[k_slot_base + row_k_base + 1][dim_col];
+                    smem.k_concat[stage][k_slot_base + row_k_base + 1][dim_col];
                 const __nv_bfloat16 b10 =
-                    smem.k_concat[k_slot_base + row_k_base + 8][dim_col];
+                    smem.k_concat[stage][k_slot_base + row_k_base + 8][dim_col];
                 const __nv_bfloat16 b11 =
-                    smem.k_concat[k_slot_base + row_k_base + 9][dim_col];
+                    smem.k_concat[stage][k_slot_base + row_k_base + 9][dim_col];
                 const uint32_t b0 = pack_bf16_pair(b00, b01);
                 const uint32_t b1 = pack_bf16_pair(b10, b11);
 
@@ -422,8 +499,25 @@ attention_kernel_phase5b(
             smem.O_acc[d_row1][d_col1] =
                 smem.O_acc[d_row1][d_col1] * rs1 + av_acc[nt][3];
         }
-        __syncthreads();
+        __syncthreads();  // all threads finished reading k_concat[stage]
+
+        // Pre-fetch chunk + kNumStages into the stage we just drained.
+        // Confirmation-3: explicit guard so we never issue a TMA for an
+        // out-of-range chunk (would pass rtol=1e-2 silently for sparse attn).
+        if (chunk + kNumStages < kNumChunks) {
+            issue_k_tma_for_chunk(smem, stage,
+                                  (chunk + kNumStages) * kBlockKv,
+                                  sparse_idx, sp_base, ckv_flat, kpe_flat, tid);
+#ifndef NDEBUG
+            if (tid == 0) debug_tma_count++;
+#endif
+        }
     }
+
+#ifndef NDEBUG
+    __syncthreads();
+    if (tid == 0) assert(debug_tma_count == kNumChunks);
+#endif
 
     // --- Final normalize + write ---
     for (int i = tid; i < kQoHeads * kHeadDimCkv; i += kThreads) {

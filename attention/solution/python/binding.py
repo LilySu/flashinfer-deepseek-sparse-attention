@@ -1,9 +1,9 @@
 """DSA sparse attention entry point.
 
 Two paths are wired up, CUDA is the default:
-  - Default (cuda): Phase 5b.3 CUDA kernel — 4-warp cooperative + TMA
-    K-load + mma.sync.m16n8k16 BF16 tensor cores for QK. 23/23 PASSED,
-    ~2.86x mean speedup vs contest reference (beats Python 2.01x).
+  - Default (cuda): Step 2a CUDA kernel — 4-warp cooperative + 2-stage
+    K TMA pipeline (thread-parallel double-buffer) + mma.sync.m16n8k16
+    BF16 tensor cores for QK and AV. 23/23 PASSED.
   - Opt-in (python): chunk-vectorized batched torch.bmm reference. Set
     DSA_ATTN_BACKEND=python to activate.
 
@@ -48,7 +48,7 @@ def _build():
         extra_inc.append(cutlass)
     try:
         _MODULE = load(
-            name="dsa_sparse_attention_phase5b",
+            name="dsa_sparse_attention_step2a",
             sources=[str(HERE / "kernel.cu")],
             extra_include_paths=extra_inc,
             extra_cuda_cflags=[
