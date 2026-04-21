@@ -110,6 +110,182 @@ Pass via function parameter, not `os.environ`. Caught twice: `scripts/ncu_profil
 
 The fused-topk attempt used a bitonic sort (O(log²N)) to replace torch.topk's CUB radix-select (O(actual N)). Launch-overhead savings were real (25-45 µs) but the replacement's compute was larger (~35 µs at padded N=8192). **A fused replacement is only a win when the replacement's algorithm matches or beats the library's asymptotic cost, not just reduces launch count.**
 
+## Architecture diagrams
+
+These three diagrams document the attention kernel's implementation strategy —
+data flow through the memory hierarchy, temporal overlap of producer/consumer,
+and spatial distribution of tensor-core work across warps.
+
+### Diagram 1 — Attention systems view: memory hierarchy + data flow + techniques
+
+Each arrow is labeled with the technique used (TMA, mma.sync tensor cores,
+scalar loads, etc.). Buffer sizes sum to the 200.2 KiB dynamic-SMEM budget.
+
+```
+┌──────────────────────── GLOBAL MEMORY (DRAM) ────────────────────────────────┐
+│  q_nope [T,16,512] bf16    q_pe [T,16,64] bf16                               │
+│  ckv_cache [P*64,512] bf16  kpe_cache [P*64,64] bf16                         │
+│  sparse_indices [T,2048] i32                                                 │
+└────────┬───────────────────────────┬────────────────────────────────────────┘
+         │ ld.global (normal)         │ cp.async.bulk TMA (Blackwell SM100a)
+         │   Q staging at              │   73,728 B per chunk = 64 slots ×
+         │   kernel entry              │   (512 ckv + 64 kpe) bf16
+         │                             │   mbarrier + arrive.expect_tx
+         │                             │   2-stage double-buffer
+         ▼                             ▼
+┌──────────────────────── SHARED MEMORY (200.2 KiB / block, 1 block/SM) ──────┐
+│                                                                              │
+│  q_concat[16][576]  bf16   ─── 18 KiB ─── staged once per token              │
+│                                                                              │
+│  k_concat[2][64][576] bf16 ─── 144 KiB ── 2 stages, TMA chunk c+1 overlaps   │
+│           │                                compute for chunk c (Diagram 2)   │
+│           └─ stage = chunk & 1,  phase = (chunk >> 1) & 1                    │
+│                                                                              │
+│  logits[16][64]    f32     ─── 4 KiB  ─── QK D-frag spill + softmax staging  │
+│  attn_bf16[16][64] bf16    ─── 2 KiB  ─── P after softmax, AV A-frag source  │
+│  O_acc[16][512]    f32     ─── 32 KiB ─── online-softmax running output      │
+│  m_state, l_state          ─── 128 B  ─── online-softmax per-head state      │
+│  k_bar[2]                  ─── 16 B   ─── mbarriers, one per stage           │
+│                                                                              │
+└────────┬─────────────────────────────────────────────────────────────────────┘
+         │ scalar u32 SMEM loads (compiler coalesced; ldmatrix Step 2f/2f-v2
+         │ rejected — see Gotcha 4)
+         ▼
+┌──────────────────────── REGISTERS (128 regs/thread, 0 spills) ──────────────┐
+│                                                                              │
+│   A frag (4 u32)   ─┐                                                        │
+│                     ├─► mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32  │
+│   B frag (2 u32)   ─┤   ┌────── BF16 Tensor Cores (SM100a) ──────┐           │
+│                     │   │  QK: 72 mma/warp/chunk × 4 warps × 32  │           │
+│                     ▼   │  AV: 64 mma/warp/chunk × 4 warps × 32  │           │
+│   D frag (4 f32)        │      (~17K mma calls/token total)      │           │
+│                         └────────────────────────────────────────┘           │
+│                                                                              │
+└────────┬─────────────────────────────────────────────────────────────────────┘
+         │ D written back to SMEM: logits[] (post-QK) or O_acc[] (post-AV)
+         │ Online softmax: m = max(m, chunk_max); rescale O by exp(m_old−m_new)
+         │ Cast FP32 attn → BF16 for AV mma input
+         ▼
+┌──────────────────────── GLOBAL MEMORY — OUTPUT ──────────────────────────────┐
+│  output[T,16,512] bf16   lse[T,16] f32   ─── final normalize + cast          │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Techniques at a glance:
+  • TMA (cp.async.bulk)   — chunks 2 & 3 of each token's K loaded asynchronously
+  • mbarrier + expect_tx  — producer/consumer sync with hardware-managed parity
+  • BF16 mma.sync tensor cores — both QK and AV (A1 landing gave AV tensor cores)
+  • Online softmax (FA-style) — m, l, O accumulated across 32 chunks per token
+  • Register-resident accumulators — O stays in regs across chunks (via 64 regs/lane)
+```
+
+### Diagram 2 — 2-stage TMA pipeline timing (Step 2a, commit `019137e`)
+
+Producer (tid==0 issues expect_tx; all 128 threads issue cp.async.bulk) runs
+one chunk ahead of the consumer so TMA latency is fully hidden behind mma compute.
+
+```
+time ────────────────────────────────────────────────────────────────────────►
+
+Producer (TMA unit):
+    ┌─TMA─┐   ┌─TMA─┐              ┌─TMA─┐              ┌─TMA─┐
+    │ c=0 │   │ c=1 │              │ c=2 │   ...        │c=31 │
+    └──┬──┘   └──┬──┘              └──┬──┘              └──┬──┘
+     fills s=0 fills s=1            fills s=0            fills s=(31&1)
+     → full[0]  → full[1]           → full[0] phase 1    → full[.] phase .
+                                      (phase bit flipped)
+
+Consumer (mma + softmax warps):
+                    ┌──────────────┐┌──────────────┐┌──────────────┐
+                    │ wait full[0] ││ wait full[1] ││ wait full[0] │
+                    │   phase=0    ││   phase=0    ││   phase=1    │
+                    │              ││              ││              │
+                    │ 72 QK mma    ││  ... c=1 ... ││ 72 QK mma    │
+                    │ + softmax    ││              ││ + softmax    │
+                    │ + 64 AV mma  ││              ││ + 64 AV mma  │
+                    │ on k_concat  ││              ││ on k_concat  │
+                    │ [stage 0]    ││              ││ [stage 0]    │
+                    │              ││              ││              │
+                    │ re-issue TMA ││ re-issue TMA ││ re-issue TMA │
+                    │ for c+2 →    ││ for c+2 →    ││ for c+2 →    │
+                    │ stage 0      ││ stage 1      ││ stage 0      │
+                    └──────────────┘└──────────────┘└──────────────┘
+                      chunk 0         chunk 1         chunk 2
+
+   ─────────────────►
+   prologue: pre-issue TMAs for c=0 → s=0 and c=1 → s=1 so the consumer
+              never blocks waiting on the first chunk.
+
+Phase-bit rule for N=2 stages (kernel.cu pipe_phase):
+    iter   stage   phase     waits_on
+      0      0       0       full[0] phase=0    ← bar[0] init phase is 0
+      1      1       0       full[1] phase=0    ← bar[1] init phase is 0
+      2      0       1       full[0] phase=1    ← bar[0] flipped after iter 0
+      3      1       1       full[1] phase=1
+      4      0       0       full[0] phase=0    ← flipped again
+     ...
+
+Total TMA issuances per token: 2 (prologue) + (32-2) = 32 = kNumChunks.
+  Debug-build asserts this count at kernel exit.
+```
+
+### Diagram 3 — Per-warp mma tile layout (how tensor-core work is split)
+
+Four warps share the 128-thread CTA; each owns a disjoint slice of the output
+so no cross-warp reduction is needed. QK partitions by N-dim (slots); AV
+partitions by N-dim (output channels).
+
+```
+QK per chunk: A=Q[M=16 heads, K=576 dims] × B=K[N=64 slots, K=576]^T → D=logits[16,64]
+
+                  ┌──────────────────────────────────────────────────────────┐
+   slot N-axis:   │                       64 slots                           │
+                  ├─────────────┬─────────────┬─────────────┬────────────────┤
+   warp owner:    │   warp 0    │   warp 1    │   warp 2    │   warp 3       │
+                  │ slots 0..15 │ slots 16..31│ slots 32..47│ slots 48..63   │
+                  │ (2 N-tiles  │ (2 N-tiles  │ (2 N-tiles  │ (2 N-tiles     │
+                  │  of 8 slots)│  of 8 slots)│  of 8 slots)│  of 8 slots)   │
+                  └─────────────┴─────────────┴─────────────┴────────────────┘
+
+   K-axis sweep:  each warp loops over all 36 K-tiles (each 16 dims wide)
+                  per warp per chunk = 2 N-tiles × 36 K-tiles = 72 mma.sync
+
+   Per-lane fragment in ONE mma.m16n8k16.row.col:
+     A [16×16 row-major bf16]       B [16×8 col-major bf16]     D [16×8 f32]
+     ┌──4 u32 per lane──────┐       ┌─2 u32 per lane─┐         ┌─4 f32──┐
+     │ heads t/4, t/4+8     │       │ cols t/4       │         │ t/4,   │
+     │ dims  (t%4)*2+       │       │ rows 2*(t%4)+  │         │ t/4+8, │
+     │       {0,1,8,9}      │       │      {0,1,8,9} │         │ (t%4)*2│
+     └──────────────────────┘       └────────────────┘         └────────┘
+
+
+AV per chunk: A=P[M=16 heads, K=64 slots] × B=V[K=64 slots, N=512 dims] → O += [16,512]
+
+                  ┌──────────────────────────────────────────────────────────┐
+   dim N-axis:    │                    512 output dims                       │
+                  ├─────────────┬─────────────┬─────────────┬────────────────┤
+   warp owner:    │   warp 0    │   warp 1    │   warp 2    │   warp 3       │
+                  │ dims 0..127 │ dims 128..255│dims 256..383│ dims 384..511 │
+                  │ (16 N-tiles │ (16 N-tiles │ (16 N-tiles │ (16 N-tiles    │
+                  │  of 8 dims) │  of 8 dims) │  of 8 dims) │  of 8 dims)    │
+                  └─────────────┴─────────────┴─────────────┴────────────────┘
+
+   K-axis sweep:  each warp loops over all 4 K-tiles (each 16 slots wide)
+                  per warp per chunk = 16 N-tiles × 4 K-tiles = 64 mma.sync
+
+   Register-resident per-lane state:
+     • 16 N-tiles × 4 f32 = 64 regs of AV accumulator (reused across chunks
+       via online-softmax rescale: O *= exp(m_old − m_new) before adding new AV)
+     • No cross-warp reduction needed — each warp owns disjoint output dim range
+
+Summary of warp specialization strategy:
+  • Compute is data-parallel across warps (no specialized TMA warp;
+    thread-parallel double-buffer is "Option B′" from Step 2a planning).
+  • Spatially, each warp owns a disjoint output slice — eliminates
+    cross-warp reductions that would dominate runtime with SMEM writes.
+  • Temporally, the 2-stage TMA pipeline (Diagram 2) overlaps K load with
+    compute so memory latency hides behind tensor-core execution.
+```
+
 ## Infrastructure committed this session (usable in future)
 
 - **`scripts/run_modal_paired_bench.py`** — A/B harness with per-workload ratios, geomean, min/max, cohort filters. Supports both kernels via `KERNEL=` env var.
