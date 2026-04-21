@@ -20,7 +20,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-KERNEL = "attention"  # paired bench only meaningful per-kernel
+KERNEL = os.environ.get("KERNEL", "attention")
+# Per-kernel baseline directory. Both candidate = solution/python/ (working copy).
+baseline_dirname = {
+    "attention": "python_baseline_2a",
+    "indexer":   "python_baseline_phase2c",
+}[KERNEL]
 
 import modal
 
@@ -44,8 +49,8 @@ image = (
         remote_path="/root/submission/solution/python",
     )
     .add_local_dir(
-        str(PROJECT_ROOT / KERNEL / "solution" / "python_baseline_2a"),
-        remote_path="/root/submission/solution/python_baseline_2a",
+        str(PROJECT_ROOT / KERNEL / "solution" / baseline_dirname),
+        remote_path=f"/root/submission/solution/{baseline_dirname}",
     )
     .add_local_file(
         str(PROJECT_ROOT / KERNEL / "config.toml"),
@@ -60,7 +65,7 @@ image = (
     timeout=3600,
     volumes={TRACE_SET_PATH: trace_volume},
 )
-def run_paired() -> dict:
+def run_paired(baseline_dirname: str = "python_baseline_2a") -> dict:
     import tomllib
     from pathlib import Path as P
     from flashinfer_bench import Benchmark, BenchmarkConfig, TraceSet, BuildSpec
@@ -80,9 +85,9 @@ def run_paired() -> dict:
     )
 
     sol_baseline = pack_solution_from_files(
-        path=str(submission_root / "solution" / "python_baseline_2a"),
+        path=str(submission_root / "solution" / baseline_dirname),
         spec=spec,
-        name="baseline_step2a",
+        name="baseline",
         definition=sol_cfg["definition"],
         author=sol_cfg["author"],
     )
@@ -135,7 +140,14 @@ def run_paired() -> dict:
         sname = trace.solution if isinstance(trace.solution, str) \
                 else getattr(trace.solution, "name", str(trace.solution))
         wid = f"w{i // 2:02d}"  # pair consecutive traces
-        per_workload.setdefault(wid, {})[sname] = {
+        axes = {}
+        try:
+            wk = trace.workload
+            axes = dict(getattr(wk, "axes", {}) or {})
+        except Exception:
+            pass
+        per_workload.setdefault(wid, {"axes": axes})
+        per_workload[wid][sname] = {
             "speedup": ev.performance.speedup_factor,
             "latency_ms": ev.performance.latency_ms,
             "ref_latency_ms": ev.performance.reference_latency_ms,
@@ -151,7 +163,7 @@ def run_paired() -> dict:
 @app.local_entrypoint()
 def main():
     import statistics
-    result = run_paired.remote()
+    result = run_paired.remote(baseline_dirname)
 
     print("\n" + "=" * 70)
     print(f"PAIRED RESULTS — {result['num_workloads']} workloads")
@@ -163,10 +175,11 @@ def main():
     below_floor = []  # ratio < 0.95 workloads
     rows = []
     for wid, sols in sorted(result["per_workload"].items(), key=lambda kv: str(kv[0])):
-        base = sols.get("baseline_step2a")
+        # sols is dict {"axes": {...}, "baseline": {...}, "candidate": {...}}
+        base = sols.get("baseline")
         cand = sols.get("candidate")
-        if not base or not cand:
-            print(f"  [{wid}] MISSING (base={bool(base)}, cand={bool(cand)})")
+        if not isinstance(base, dict) or "speedup" not in base or \
+           not isinstance(cand, dict) or "speedup" not in cand:
             continue
         if base["status"] != "PASSED" or cand["status"] != "PASSED":
             print(f"  [{wid}] NON-PASS (base={base['status']}, cand={cand['status']})")
@@ -179,9 +192,13 @@ def main():
             below_floor.append((wid, ratio))
         rows.append((wid, base["speedup"], cand["speedup"], ratio))
 
-    print(f"{'wid':<40} {'baseline':>10} {'candidate':>10} {'ratio':>8}")
+    print(f"{'wid':<8} {'baseline':>10} {'candidate':>10} {'ratio':>8}  axes")
+    # fetch axes from per_workload above for print
+    pw = result["per_workload"]
     for wid, b, c, r in rows:
-        print(f"{str(wid):<40} {b:>10.3f} {c:>10.3f} {r:>8.4f}")
+        ax = pw.get(wid, {}).get("axes", {}) if isinstance(pw.get(wid), dict) else {}
+        ax_short = ", ".join(f"{k}={v}" for k, v in ax.items())
+        print(f"{str(wid):<8} {b:>10.3f} {c:>10.3f} {r:>8.4f}  {ax_short}")
 
     if ratios:
         # Geomean of ratios is the commit signal.
@@ -192,6 +209,39 @@ def main():
         print(f"Max  ratio:        {max(ratios):.4f}")
         print(f"Arithmetic baseline mean:  {statistics.mean(baseline_speedups):.3f}")
         print(f"Arithmetic candidate mean: {statistics.mean(candidate_speedups):.3f}")
+
+        # Short-cohort geomean (indexer-specific): workloads with B <= 2 AND
+        # max_num_pages <= 8 — where the fused-topk optimization targets
+        # launch-overhead dominance. Computed separately because the overall
+        # geomean dilutes short-cohort wins across 128 workloads where the
+        # optimization has little leverage.
+        short_ratios = []
+        short_list = []
+        for wid, sols in result["per_workload"].items():
+            ax = sols.get("axes", {}) if isinstance(sols, dict) else {}
+            if not ax:
+                continue
+            B = ax.get("batch_size", None)
+            mp = ax.get("max_num_pages", None)
+            if B is None or mp is None:
+                continue
+            if B <= 2 and mp <= 8:
+                base = sols.get("baseline")
+                cand = sols.get("candidate")
+                if isinstance(base, dict) and isinstance(cand, dict) \
+                   and "speedup" in base and "speedup" in cand:
+                    r = cand["speedup"] / base["speedup"]
+                    short_ratios.append(r)
+                    short_list.append((wid, B, mp, r))
+        if short_ratios:
+            short_geomean = math.exp(
+                sum(math.log(r) for r in short_ratios) / len(short_ratios))
+            print(f"\n--- Short cohort (B≤2 AND max_num_pages≤8, n={len(short_ratios)}) ---")
+            for wid, B, mp, r in sorted(short_list, key=lambda x: x[0]):
+                print(f"  {wid}  B={B} mp={mp}  ratio={r:.4f}")
+            print(f"  Short-cohort geomean: {short_geomean:.4f}  "
+                  f"({(short_geomean-1)*100:+.2f}%)")
+
         if below_floor:
             print(f"\n!! {len(below_floor)} workload(s) with ratio < 0.95 (regressions):")
             for wid, r in below_floor:
