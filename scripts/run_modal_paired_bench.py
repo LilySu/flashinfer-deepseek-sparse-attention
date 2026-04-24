@@ -40,6 +40,8 @@ image = (
     )
     .apt_install("git", "build-essential")
     .pip_install("torch", "numpy", "ninja")
+    # CuTe DSL package — needed for INDEXER_BACKEND=cute_dsl candidate.
+    .pip_install("nvidia-cutlass-dsl")
     .run_commands(
         "git clone https://github.com/flashinfer-ai/flashinfer-bench.git /opt/flashinfer-bench",
         "cd /opt/flashinfer-bench && pip install -v -e .",

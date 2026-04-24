@@ -31,6 +31,10 @@ _MODULE_2D = None
 # full diagnosis. binding routes to 2c on all shapes.
 _FORCE_2D = os.environ.get("USE_PHASE_2D", "0")  # "1" / "0" / "auto"
 
+# Optional opt-in to the CuTe DSL (UMMA) backend. Default stays Phase 2c so
+# submission-v12 behavior is preserved when the env var is unset.
+_INDEXER_BACKEND = os.environ.get("INDEXER_BACKEND", "phase2c")
+
 
 def _cutlass_include_dir():
     # Phase 2b+ will need CUTLASS/CuTe. Phase 2a does not, but leaving the
@@ -184,6 +188,124 @@ def _diag_compare_logits(cuda_logits, q, k_cache, w, sl, bt, max_num_pages):
         f.write(json.dumps(entry) + "\n")
 
 
+def _cute_dsl_kernel(
+    q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table,
+    B, max_num_pages, max_seq_len_kv, device,
+):
+    """CuTe DSL UMMA path — Phase 1 MVP.
+
+    Approach: heavy Python pre/post-processing wrapping a clean batched-GEMM
+    kernel. Validates UMMA correctness end-to-end at the cost of some Python
+    overhead. Optimization to reduce that overhead is Phase 2.
+
+    Steps:
+      1. Unpack K cache: separate FP8 K data + FP32 per-slot scales.
+      2. Pre-gather K via block_table → contiguous K[B, max_pages, 64, 128].
+      3. Pre-replicate Q across pages → Q[B, max_pages, 64, 128].
+      4. Reshape both with K-innermost stride for CuTe (M, K, L) and
+         (N, K, L) layouts (L = B * max_pages).
+      5. Launch kernel → raw S[128, 64, L] FP32 scores.
+      6. Apply per-slot scale × ReLU × per-head weighted-sum → flatten to
+         logits[B, max_seq_len_kv].
+    """
+    from .cute_dsl import kernel as cute_dsl_kernel
+    from cutlass.cute.runtime import from_dlpack
+
+    NUM_HEADS = 64
+    HEAD_DIM = 128
+    UMMA_M = 128
+
+    # 1. Unpack K cache (kPageSize=64 slots × (128 FP8 + 4 FP32-scale bytes))
+    k_u8 = k_index_cache_fp8.view(torch.uint8)
+    num_pages = k_u8.shape[0]
+    kv_flat = k_u8.view(num_pages, kPageSize * (HEAD_DIM + 4))
+    k_fp8_bytes = kv_flat[:, : kPageSize * HEAD_DIM].contiguous()
+    k_fp8 = k_fp8_bytes.view(num_pages, kPageSize, HEAD_DIM).view(
+        torch.float8_e4m3fn)
+    scale_bytes = kv_flat[:, kPageSize * HEAD_DIM:].contiguous()
+    k_scales = scale_bytes.view(num_pages, kPageSize, 4).view(
+        torch.float32)[..., 0]  # [num_pages, 64]
+
+    # 2. Pre-gather K via block_table.
+    # block_table is [B, max_num_pages] int32; clamp -1 to 0 for safe indexing.
+    bt_safe = block_table.clamp(min=0).to(torch.long)
+    k_gathered = k_fp8[bt_safe]      # [B, max_pages, 64, 128] FP8
+    s_gathered = k_scales[bt_safe]   # [B, max_pages, 64] FP32
+
+    # 3. Pre-replicate Q across pages.
+    # q_index_fp8 is [B, 64, 128] FP8.
+    q_replicated = q_index_fp8.unsqueeze(1).expand(B, max_num_pages, NUM_HEADS, HEAD_DIM)
+
+    # 4. Reshape with K-innermost for CuTe (M, K, L) / (N, K, L).
+    # L = B * max_num_pages. Flatten the batch×page axes.
+    L = B * max_num_pages
+    # q_for_kernel: torch (L, M=64, K=128) contig (K innermost) → permute to CuTe (M, K, L)
+    q_lmk = q_replicated.reshape(L, NUM_HEADS, HEAD_DIM).contiguous()
+    q_mkl = q_lmk.permute(1, 2, 0)  # CuTe (M, K, L), strides (K, 1, M*K)
+    # k_for_kernel: torch (L, N=64, K=128) contig → permute to CuTe (N, K, L)
+    k_lnk = k_gathered.reshape(L, kPageSize, HEAD_DIM).contiguous()
+    k_nkl = k_lnk.permute(1, 2, 0)
+    # s_out: torch (L, M=128, N=64) FP32 → permute to CuTe (M, N, L)
+    s_lmn = torch.zeros(L, UMMA_M, kPageSize, dtype=torch.float32, device=device)
+    s_mnl = s_lmn.permute(1, 2, 0)
+
+    # 5. Launch kernel.
+    cQ = from_dlpack(q_mkl, assumed_align=16)
+    cK = from_dlpack(k_nkl, assumed_align=16)
+    cS = from_dlpack(s_mnl, assumed_align=16)
+    cute_dsl_kernel.run(cQ, cK, cS)
+
+    # 6. Apply ReLU + per-head-weighted-sum + per-slot scale.
+    # s_lmn shape: (L=B*max_pages, M_padded=128, N=64). First NUM_HEADS rows valid.
+    s_valid = s_lmn[:, :NUM_HEADS, :]   # (L, NUM_HEADS, 64)
+    s_relu = torch.relu(s_valid)
+    # Reshape: split L into (B, max_pages)
+    s_relu = s_relu.view(B, max_num_pages, NUM_HEADS, kPageSize)
+    # weighted sum over heads: for each (b, page, slot), Σ_h w[b, h] · ReLU(S[b, page, h, slot])
+    # weights: [B, NUM_HEADS]. Use einsum.
+    weighted = torch.einsum("bphs,bh->bps", s_relu, weights)  # [B, max_pages, 64]
+    # Apply per-slot scale: s_gathered shape (B, max_pages, 64) FP32
+    weighted = weighted * s_gathered
+
+    # 7. Flatten (B, max_pages, 64) → (B, max_pages * 64) and write to logits.
+    logits = torch.full(
+        (B, max_seq_len_kv), float("-inf"),
+        dtype=torch.float32, device=device,
+    )
+    flat = weighted.view(B, max_num_pages * kPageSize)
+    # Mask: only positions within seq_len[b] get the computed value; rest -inf.
+    seq_arange = torch.arange(max_seq_len_kv, device=device).unsqueeze(0)  # [1, max_seq]
+    in_range = seq_arange < seq_lens.unsqueeze(1)  # [B, max_seq]
+    logits = torch.where(in_range, flat, logits)
+
+    if _DIAG:
+        torch.cuda.synchronize()
+        _diag_compare_logits(
+            logits, q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table,
+            max_num_pages,
+        )
+
+    # Stage B — same Python topk + gather + remap as the Phase 2c path.
+    actual_k = min(kTopK, max_seq_len_kv)
+    top_vals, local_idx = torch.topk(logits, actual_k, dim=1)
+    page_local_idx = local_idx // kPageSize
+    offset = (local_idx % kPageSize).to(torch.int32)
+    bt_long = block_table.to(torch.long)
+    global_page = torch.gather(bt_long, 1, page_local_idx)
+    topk_tokens = (global_page.to(torch.int32) * kPageSize + offset)
+    topk_tokens = torch.where(
+        torch.isinf(top_vals),
+        torch.full_like(topk_tokens, -1),
+        topk_tokens,
+    )
+    if actual_k < kTopK:
+        pad = torch.full((B, kTopK - actual_k), -1, dtype=torch.int32, device=device)
+        topk_indices = torch.cat([topk_tokens, pad], dim=1)
+    else:
+        topk_indices = topk_tokens
+    return (topk_indices,)
+
+
 @torch.no_grad()
 def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     """DSA topk indexer entry point.
@@ -211,6 +333,13 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
         mod2d.fused_phase2d(q_u8, k_u8, weights, seq_lens, block_table,
                             topk_indices, skip_counts)
         return (topk_indices,)
+
+    # ---- CuTe DSL UMMA path (opt-in via INDEXER_BACKEND=cute_dsl) ---------
+    if _INDEXER_BACKEND == "cute_dsl":
+        return _cute_dsl_kernel(
+            q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table,
+            B, max_num_pages, max_seq_len_kv, device,
+        )
 
     mod = _build()
 

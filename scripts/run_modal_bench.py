@@ -34,6 +34,10 @@ image = (
     )
     .apt_install("git", "build-essential")
     .pip_install("torch", "numpy", "ninja")
+    # nvidia-cutlass-dsl provides cutlass.cute / cutlass.pipeline for the
+    # CuTe DSL UMMA path (INDEXER_BACKEND=cute_dsl). Compatible with cuda
+    # 13.0 image; verified on flashinfer/flashinfer-ci-cu132 via smoke test.
+    .pip_install("nvidia-cutlass-dsl")
     .run_commands(
         "git clone https://github.com/flashinfer-ai/flashinfer-bench.git /opt/flashinfer-bench",
         "cd /opt/flashinfer-bench && pip install -v -e .",
@@ -49,7 +53,11 @@ image = (
 )
 
 
-_DIAG_ENV = {"PHASE2A_DIAG": os.environ.get("PHASE2A_DIAG", "0")}
+_DIAG_ENV = {
+    "PHASE2A_DIAG": os.environ.get("PHASE2A_DIAG", "0"),
+    "INDEXER_BACKEND": os.environ.get("INDEXER_BACKEND", "phase2c"),
+    "DSA_ATTN_BACKEND": os.environ.get("DSA_ATTN_BACKEND", "cuda"),
+}
 
 
 @app.function(

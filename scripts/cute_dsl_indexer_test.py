@@ -61,21 +61,26 @@ def test():
     HEAD_DIM = lay.HEAD_DIM
     PAGE_SIZE = lay.PAGE_SIZE
     UMMA_M_PADDED = 128
-    L = 1  # single GEMM (no batching) for correctness debug
+    L = 4  # multi-CTA batched test
 
-    # MVP layout: 3D tensors with L=1 to match the kernel's mA_mkl signature
-    # while testing a single Q@K^T computation.
-    q = torch.randn(NUM_HEADS, HEAD_DIM, L, dtype=torch.float32, device="cuda")
-    q = q.clamp(-3, 3).to(torch.float8_e4m3fn)
-    print(f"  q shape={tuple(q.shape)} dtype={q.dtype}")
+    # CuTe wants K-innermost in mA_mkl (M, K, L) — torch's default contiguous
+    # is (M, K, L) → strides (K*L, L, 1) which has L innermost. Wrong for TMA.
+    # Allocate as (L, M, K) contiguous (strides (M*K, K, 1), K innermost) and
+    # permute(1, 2, 0) to view as (M, K, L) with strides (K, 1, M*K). Same memory.
+    q_lmk = torch.randn(L, NUM_HEADS, HEAD_DIM, dtype=torch.float32, device="cuda")
+    q_lmk = q_lmk.clamp(-3, 3).to(torch.float8_e4m3fn).contiguous()
+    q = q_lmk.permute(1, 2, 0)  # CuTe (M=NUM_HEADS, K=HEAD_DIM, L)
+    print(f"  q shape={tuple(q.shape)} strides={q.stride()} dtype={q.dtype}")
 
-    k = torch.randn(PAGE_SIZE, HEAD_DIM, L, dtype=torch.float32, device="cuda")
-    k = k.clamp(-3, 3).to(torch.float8_e4m3fn)
-    print(f"  k shape={tuple(k.shape)} dtype={k.dtype}")
+    k_lnk = torch.randn(L, PAGE_SIZE, HEAD_DIM, dtype=torch.float32, device="cuda")
+    k_lnk = k_lnk.clamp(-3, 3).to(torch.float8_e4m3fn).contiguous()
+    k = k_lnk.permute(1, 2, 0)  # CuTe (N=PAGE_SIZE, K=HEAD_DIM, L)
+    print(f"  k shape={tuple(k.shape)} strides={k.stride()} dtype={k.dtype}")
 
-    s_out = torch.zeros(UMMA_M_PADDED, PAGE_SIZE, L,
-                        dtype=torch.float32, device="cuda")
-    print(f"  s_out shape={tuple(s_out.shape)}")
+    # Output: CuTe (M, N, L) with N innermost (strides (N, 1, M*N)).
+    s_lmn = torch.zeros(L, UMMA_M_PADDED, PAGE_SIZE, dtype=torch.float32, device="cuda")
+    s_out = s_lmn.permute(1, 2, 0)  # CuTe (M=128, N=64, L)
+    print(f"  s_out shape={tuple(s_out.shape)} strides={s_out.stride()}")
 
     print()
     print("=" * 70)
@@ -108,24 +113,28 @@ def test():
         print(f"  run() returned. wall={t:.2f}s")
         print(f"  s_out[:4, :4, 0] = {s_out[:4, :4, 0]}")
 
-        # Reference compute on slice L=0
-        q_fp32 = q[:, :, 0].to(torch.float32)
-        k_fp32 = k[:, :, 0].to(torch.float32)
-        s_ref = q_fp32 @ k_fp32.T  # [NUM_HEADS, PAGE_SIZE]
-        s_kernel = s_out[:NUM_HEADS, :, 0]
-        diff = (s_kernel - s_ref).abs()
-        print(f"  s_ref [:4, :4]      = {s_ref[:4, :4].tolist()}")
-        print(f"  s_kernel[:4, :4]    = {s_kernel[:4, :4].tolist()}")
-        print(f"  s_ref magnitude     mean_abs={s_ref.abs().mean():.3f} max_abs={s_ref.abs().max():.3f}")
-        print(f"  s_kernel magnitude  mean_abs={s_kernel.abs().mean():.3f} max_abs={s_kernel.abs().max():.3f}")
-        print(f"  diff                mean_abs={diff.mean():.3f} max_abs={diff.max():.3f}")
+        # Reference compute per L-slice
+        max_diffs = []
+        for l in range(L):
+            q_fp32 = q[:, :, l].to(torch.float32)
+            k_fp32 = k[:, :, l].to(torch.float32)
+            s_ref = q_fp32 @ k_fp32.T  # [NUM_HEADS, PAGE_SIZE]
+            s_kernel = s_out[:NUM_HEADS, :, l]
+            diff = (s_kernel - s_ref).abs()
+            mx = diff.max().item()
+            mn = diff.mean().item()
+            max_diffs.append(mx)
+            print(f"  L={l}: ref mag={s_ref.abs().mean():.3f}, kernel mag={s_kernel.abs().mean():.3f}, diff mean={mn:.3f} max={mx:.3f}")
+        all_ok = all(d < 1e-3 for d in max_diffs)
+        print(f"  ALL L SLICES MATCH: {all_ok}")
 
-        # Check: are SOME values matching exactly? If yes, layout issue (some
-        # threads write to wrong place). If diff is uniform & small, FP8 noise.
-        rel = diff / (s_ref.abs() + 1e-3)
-        print(f"  rel err             mean={rel.mean():.4f} max={rel.max():.4f}")
-
-        return {"step": "run", "ok": True, "wall_s": t}
+        return {
+            "step": "run",
+            "ok": True,
+            "wall_s": t,
+            "all_l_match": all_ok,
+            "max_diffs": max_diffs,
+        }
     except Exception as e:
         print(f"  run() FAIL: {type(e).__name__}: {e}")
         traceback.print_exc()
