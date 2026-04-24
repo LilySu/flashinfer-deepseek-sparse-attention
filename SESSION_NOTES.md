@@ -1,6 +1,6 @@
-# Session notes — 2026-04-19 through 2026-04-21
+# Session notes — 2026-04-19 through 2026-04-24
 
-Shipping state after three work days on branch `against-2ba145`. Attention is at its local optimum for this algorithmic layout; indexer is at its proven Phase 2c baseline with one further wedge ruled out this session.
+Shipping state across four work days on branch `against-2ba145`. Final submission for the 2026-04-24 contest deadline is **`submission-v12`** at commit `ba8e05b`. Attention is at its local optimum for this algorithmic layout; indexer is at its proven Phase 2c baseline; an additional CuTe DSL bring-up was attempted on the deadline day and reached partial correctness but did not land the paired-bench gate (see Part J below).
 
 ## Shipping state (commit `d2233f6`)
 
@@ -292,3 +292,45 @@ Summary of warp specialization strategy:
 - **`scripts/probe_ptxas.py`** — direct nvcc compile with `-ptxas-options=-v` to capture register count / SMEM / spill info without going through torch JIT.
 - **`scripts/ncu_profile.py`** — Pass-1 NCU triage with per-kernel section sets. Fixed kernel-kind propagation.
 - **`indexer/solution/python_baseline_phase2c/`** and **`attention/solution/python_baseline_2a/`** — frozen baselines for paired-bench comparison against future candidates.
+
+## Part J — CuTe DSL bring-up attempt (2026-04-24)
+
+Branch `cute-dsl-port` (forked from `against-2ba145`, last commit `7a6eced`). Untouched by submission-v12.
+
+**Phase 0 (toolchain smoke) — PASSED.** On the eval-matched container `flashinfer/flashinfer-ci-cu132:20260401-2c675fb`:
+- `cutlass.cute`, `cutlass.pipeline`, `cutlass.utils`, `cutlass.cute.nvgpu.{cpasync,tcgen05}`, `cutlass.cute.runtime` all import.
+- Trivial `@cute.jit` vector-add: cold JIT 221ms, warm 7us, max_err 0.0.
+- MMA atoms present in this version: `tcgen05.MmaF16BF16Op` (BF16, attention-ready), `tcgen05.MmaFP8Op` (NOT `MmaF8F6F4Op` as the SURVEY assumed), `MmaTF32Op`, `MmaI8Op`, plus block-scaled variants `MmaMXF4Op` / `MmaMXF8Op` / `MmaMXF4NVF4Op` / `BlockScaledMmaOp`.
+- All Pipeline classes (`PipelineTmaUmma`, `PipelineUmmaAsync`, `PipelineTmaAsync`), `CooperativeGroup`, `NamedBarrier`, `utils.TmemAllocator` present.
+
+**Phase 1 (indexer kernel, near-verbatim port of `fp16_gemm_0.py` with FP8 swap, atom shape M=128/N=64/K=32) — PARTIAL.**
+- Compiles, JITs, launches end-to-end on Modal B200.
+- **L=1 single-GEMM correctness: BIT-EXACT match vs torch reference** (max_err=0.000, rel_err=0.000) on FP8 Q @ K^T → FP32 with K=128.
+- **L>1 (multi-CTA grid=(1,1,L)) NOT correct.** Runs without error but produces wrong values for blocks beyond the first. Likely cause: TMEM contention or pipeline state shared between concurrent CTAs. The `fp16_gemm_0.py` reference is designed for single-GEMM and does not handle batched multi-CTA without the persistent-kernel infrastructure of `dense_gemm.py`.
+
+**API divergences from documentation/example survey (record for future sessions):**
+- `MmaFP8Op` is the FP8 atom name — `MmaF8F6F4Op` does not exist in this version.
+- `storage.<int_field>.ptr` → access without `.ptr`; the field accessor returns a `_Pointer` directly. The fp16_gemm_0.py `.ptr` pattern is older API.
+- Grid must be ≤ 3D; `cute.ceil_div((*c.shape, 1), tiler)` emits 4D in this version. Use a hardcoded 3D `grid_shape` instead.
+- `subtile_cnt` for `tmem_thr_copy` must satisfy `threads × per-thread-load == tile_size`. With `Ld32x32bOp(Repetition.x64)` per-thread is 64 fp32; for our N=64 use `subtile_cnt=1` (not 4 as in the reference for N=256).
+- `from_dlpack` must be called OUTSIDE `@cute.jit`; calling inside fails with `_Tensor has no __dlpack__`.
+
+**Why the gate failed today:**
+- Phase 1 correctness gate is 128/128 PASSED on bench. We have only single-CTA correctness. Cycles to debug the L>1 path were estimated at 2-4 more hours which exceeded the deadline budget.
+- Per the abandonment ladder in the plan (Phase 1 ≥ 3hr without 128/128 → abandon, ship v12), the ship decision is mechanical and correct.
+
+**Artifacts on `cute-dsl-port` branch (preserved for next session):**
+- `indexer/solution/python/cute_dsl/layouts.py` (commit `2d8bb1f`) — hierarchical layout scaffold.
+- `indexer/solution/python/cute_dsl/kernel.py` (commit `7a6eced`) — fp16_gemm_0.py-modeled kernel with FP8 atom; bit-exact for L=1.
+- `indexer/solution/python/cute_dsl/__init__.py` — package marker.
+- `scripts/cute_dsl_smoke.py` — toolchain probe (Phase 0 evidence).
+- `scripts/cute_dsl_indexer_test.py` — single-shape correctness harness with diagnostic comparison vs torch reference.
+
+**Next-session entry point (if attempting Phase 1 again):**
+1. Start by reading `examples/python/CuTeDSL/blackwell/dense_gemm.py` for the multi-CTA / persistent-kernel pattern. The L>1 batched case requires either explicit per-CTA TMEM management (separate TMEM regions) or the persistent-kernel work-distribution loop, not the simple single-GEMM control flow of `fp16_gemm_0.py`.
+2. The L=1 path in `kernel.py` is the proof that FP8 `MmaFP8Op` UMMA works and produces correct output — that's a concrete foundation, not a wasted effort.
+3. Once L>1 correct, plug into `binding.py` via `INDEXER_BACKEND=cute_dsl` env-var dispatch (slot already exists in the plan), then run `KERNEL=indexer uvx modal run scripts/run_modal_paired_bench.py` against the frozen Phase 2c baseline.
+
+## Final submission
+
+**`submission-v12`** at commit `ba8e05b` on `against-2ba145`. 23/23 attention PASSED, 128/128 indexer PASSED, replicated today on Modal B200. Composite arithmetic mean of the two kernel speedups: 9.5–12.8× across Modal B200 instance variance (today's ~9.5×; favorable instance ~12.8×). Top performer per the prior results email is 11.3×; we sit in the same band depending on which Modal instance the eval container lands on.
