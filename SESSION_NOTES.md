@@ -1,6 +1,6 @@
 # Session notes — 2026-04-19 through 2026-04-24
 
-Shipping state across four work days on branch `against-2ba145`. Final submission for the 2026-04-24 contest deadline is **`submission-v12`** at commit `ba8e05b`. Attention is at its local optimum for this algorithmic layout; indexer is at its proven Phase 2c baseline; an additional CuTe DSL bring-up was attempted on the deadline day and reached partial correctness but did not land the paired-bench gate (see Part J below).
+Shipping state across four work days on branch `against-2ba145`. Final submission for the 2026-04-24 contest deadline is **`submission-v12`** at commit `ba8e05b`. Attention is at its local optimum for this algorithmic layout; indexer is at its proven Phase 2c baseline. A CuTe DSL UMMA bring-up landed end-to-end correctness on day 4 (**128/128 PASSED at parity speedup vs Phase 2c**, paired-bench geomean 1.0012) but did not clear the +15% paired-bench gate for switching the default. The cute_dsl path is preserved as opt-in on branch `cute-dsl-port` for future work — see Part J below.
 
 ## Shipping state (commit `d2233f6`)
 
@@ -293,43 +293,81 @@ Summary of warp specialization strategy:
 - **`scripts/ncu_profile.py`** — Pass-1 NCU triage with per-kernel section sets. Fixed kernel-kind propagation.
 - **`indexer/solution/python_baseline_phase2c/`** and **`attention/solution/python_baseline_2a/`** — frozen baselines for paired-bench comparison against future candidates.
 
-## Part J — CuTe DSL bring-up attempt (2026-04-24)
+## Part J — CuTe DSL bring-up (2026-04-24): Phase 1 LANDED, gate not met
 
-Branch `cute-dsl-port` (forked from `against-2ba145`, last commit `7a6eced`). Untouched by submission-v12.
+Branch `cute-dsl-port` (forked from `against-2ba145`, last commit `adedf0e`). Untouched by submission-v12.
 
-**Phase 0 (toolchain smoke) — PASSED.** On the eval-matched container `flashinfer/flashinfer-ci-cu132:20260401-2c675fb`:
-- `cutlass.cute`, `cutlass.pipeline`, `cutlass.utils`, `cutlass.cute.nvgpu.{cpasync,tcgen05}`, `cutlass.cute.runtime` all import.
+### Phase 0 (toolchain smoke) — PASSED
+
+On eval-matched container `flashinfer/flashinfer-ci-cu132:20260401-2c675fb`:
+- All imports clean: `cutlass.cute`, `cutlass.pipeline`, `cutlass.utils`, `cutlass.cute.nvgpu.{cpasync,tcgen05}`, `cutlass.cute.runtime`.
 - Trivial `@cute.jit` vector-add: cold JIT 221ms, warm 7us, max_err 0.0.
-- MMA atoms present in this version: `tcgen05.MmaF16BF16Op` (BF16, attention-ready), `tcgen05.MmaFP8Op` (NOT `MmaF8F6F4Op` as the SURVEY assumed), `MmaTF32Op`, `MmaI8Op`, plus block-scaled variants `MmaMXF4Op` / `MmaMXF8Op` / `MmaMXF4NVF4Op` / `BlockScaledMmaOp`.
-- All Pipeline classes (`PipelineTmaUmma`, `PipelineUmmaAsync`, `PipelineTmaAsync`), `CooperativeGroup`, `NamedBarrier`, `utils.TmemAllocator` present.
+- MMA atoms present: `MmaF16BF16Op`, `MmaFP8Op` (NOT `MmaF8F6F4Op` as SURVEY assumed), `MmaTF32Op`, `MmaI8Op`, plus block-scaled `MmaMXF4Op` / `MmaMXF8Op` / `MmaMXF4NVF4Op` / `BlockScaledMmaOp`.
+- All Pipeline classes + `TmemAllocator` present.
 
-**Phase 1 (indexer kernel, near-verbatim port of `fp16_gemm_0.py` with FP8 swap, atom shape M=128/N=64/K=32) — PARTIAL.**
-- Compiles, JITs, launches end-to-end on Modal B200.
-- **L=1 single-GEMM correctness: BIT-EXACT match vs torch reference** (max_err=0.000, rel_err=0.000) on FP8 Q @ K^T → FP32 with K=128.
-- **L>1 (multi-CTA grid=(1,1,L)) NOT correct.** Runs without error but produces wrong values for blocks beyond the first. Likely cause: TMEM contention or pipeline state shared between concurrent CTAs. The `fp16_gemm_0.py` reference is designed for single-GEMM and does not handle batched multi-CTA without the persistent-kernel infrastructure of `dense_gemm.py`.
+### Phase 1 (indexer FP8 UMMA kernel) — CORRECTNESS LANDED, GATE NOT MET
 
-**API divergences from documentation/example survey (record for future sessions):**
+Near-verbatim port of `fp16_gemm_0.py` with FP8 swap, atom shape `(M=128, N=64, K=32)`, plus heavy Python pre/post-processing wrapper. **128/128 PASSED on real contest workloads.**
+
+**10-iteration bring-up trail** (see commit `adedf0e` for details):
+1. `MmaFP8Op` 8-arg signature → 7 args
+2. `storage.<int>.ptr` → drop `.ptr` (newer API returns `_Pointer` directly)
+3. `TmemAllocator` requires `barrier_for_retrieve=NamedBarrier`
+4. Full near-verbatim port of `fp16_gemm_0.py`
+5. Grid > 3D (`cute.ceil_div` padding) → hardcoded 3D `(1, 1, L)`
+6. **L=1 single-CTA correctness ACHIEVED** (max_err=0.0)
+7. `subtile_cnt=4` wrong for our N=64 → set to 1
+8. L=8 multi-CTA wrong values
+9. L=1 confirmed bit-exact (rule out single-CTA regression)
+10. **K-innermost stride fix → L=4 BIT-EXACT all slices** ✓
+
+**The L>1 multi-CTA bug** turned out to be torch tensor stride convention. CuTe wants K-innermost in `mA_mkl` shape `(M, K, L)`, but `torch.randn(M, K, L)` is contiguous with L-innermost (strides `M*K, L, 1`). Fix: allocate as `torch.randn(L, M, K).contiguous()` (strides `M*K, K, 1` — K innermost) and `permute(1, 2, 0)` for the CuTe view — same memory, K-innermost stride pattern. The `fp16_gemm_0.py` reference is 2D so this never came up.
+
+**End-to-end bench results** (CuTe DSL UMMA, INDEXER_BACKEND=cute_dsl):
+- `KERNEL=indexer INDEXER_BACKEND=cute_dsl run_modal_bench.py`:
+  - **128/128 PASSED**, mean 14.841×, median 13.334×, min 7.040×, max 28.491×
+  - vs Phase 2c baseline same session: mean 14.872×, median 13.485×, min 7.264×, max 28.695× — *virtually identical*
+- Paired bench (cute_dsl candidate vs Phase 2c baseline, same Modal session):
+  - Geomean(new/old): **1.0012 (+0.12%)**
+  - Min ratio: 0.9672 / Max ratio: 1.0427
+  - Short-cohort geomean: 0.9972 (-0.28%)
+  - No workload below 0.95 floor
+
+**Verdict.** Phase 2 commit gate is geomean ≥ 1.15. Achieved +0.12%. **Per the abandonment ladder, ship submission-v12 unchanged.**
+
+**Why the win is hidden.** The CuTe DSL kernel does FP8 UMMA scoring (Blackwell tensor cores engaged), but the Python pre/post-processing wrapper — pre-gather K via block_table, pre-replicate Q across pages, post-process ReLU + Σ_h w[h]·S[h, slot] · scale[slot] — adds enough overhead to nearly cancel the UMMA win. NCU-style breakdown not needed; the math is straightforward.
+
+**Why this is still a major Phase 1 milestone.** The CuTe DSL path is correct end-to-end on all 128 contest workloads, with FP8 tensor cores actually engaging. Unlocks Phase 2 optimization (move pre/post into the kernel) for future sessions.
+
+### API divergences from documentation/example survey (recorded for future sessions)
+
 - `MmaFP8Op` is the FP8 atom name — `MmaF8F6F4Op` does not exist in this version.
-- `storage.<int_field>.ptr` → access without `.ptr`; the field accessor returns a `_Pointer` directly. The fp16_gemm_0.py `.ptr` pattern is older API.
-- Grid must be ≤ 3D; `cute.ceil_div((*c.shape, 1), tiler)` emits 4D in this version. Use a hardcoded 3D `grid_shape` instead.
-- `subtile_cnt` for `tmem_thr_copy` must satisfy `threads × per-thread-load == tile_size`. With `Ld32x32bOp(Repetition.x64)` per-thread is 64 fp32; for our N=64 use `subtile_cnt=1` (not 4 as in the reference for N=256).
-- `from_dlpack` must be called OUTSIDE `@cute.jit`; calling inside fails with `_Tensor has no __dlpack__`.
+- `storage.<int_field>` returns `_Pointer` directly; drop the `.ptr` accessor that the older `fp16_gemm_0.py` reference uses.
+- Grid must be ≤ 3D; `cute.ceil_div((*c.shape, 1), tiler)` emits 4D. Use a hardcoded 3D `grid_shape`.
+- `subtile_cnt` for `tmem_thr_copy` must satisfy `threads × per-thread-load == tile_size`. For our N=64 with `Ld32x32bOp(Repetition.x64)` (64 fp32/thread), `subtile_cnt=1` (not 4 as in reference for N=256).
+- `from_dlpack` must be called **outside** `@cute.jit`. Inside fails with `_Tensor has no __dlpack__`.
+- **Critical**: torch's default contiguous layout for 3D tensors `(M, K, L)` has L-innermost. CuTe expects K-innermost. Fix via `torch.randn(L, M, K).contiguous().permute(1, 2, 0)`.
 
-**Why the gate failed today:**
-- Phase 1 correctness gate is 128/128 PASSED on bench. We have only single-CTA correctness. Cycles to debug the L>1 path were estimated at 2-4 more hours which exceeded the deadline budget.
-- Per the abandonment ladder in the plan (Phase 1 ≥ 3hr without 128/128 → abandon, ship v12), the ship decision is mechanical and correct.
+### Artifacts on `cute-dsl-port` (commit `adedf0e`)
 
-**Artifacts on `cute-dsl-port` branch (preserved for next session):**
-- `indexer/solution/python/cute_dsl/layouts.py` (commit `2d8bb1f`) — hierarchical layout scaffold.
-- `indexer/solution/python/cute_dsl/kernel.py` (commit `7a6eced`) — fp16_gemm_0.py-modeled kernel with FP8 atom; bit-exact for L=1.
+- `indexer/solution/python/cute_dsl/layouts.py` — hierarchical layout scaffold.
+- `indexer/solution/python/cute_dsl/kernel.py` — `@cute.jit` + `@cute.kernel` FP8 UMMA, multi-CTA batched, bit-exact.
 - `indexer/solution/python/cute_dsl/__init__.py` — package marker.
-- `scripts/cute_dsl_smoke.py` — toolchain probe (Phase 0 evidence).
-- `scripts/cute_dsl_indexer_test.py` — single-shape correctness harness with diagnostic comparison vs torch reference.
+- `indexer/solution/python/binding.py` — adds `_cute_dsl_kernel()` + `INDEXER_BACKEND=cute_dsl` env-var dispatch. **Default stays `phase2c` so submission-v12 behavior is preserved.**
+- `scripts/cute_dsl_smoke.py` — toolchain probe.
+- `scripts/cute_dsl_indexer_test.py` — single-shape correctness harness.
+- `scripts/run_modal_bench.py` and `run_modal_paired_bench.py` — `pip install nvidia-cutlass-dsl`.
 
-**Next-session entry point (if attempting Phase 1 again):**
-1. Start by reading `examples/python/CuTeDSL/blackwell/dense_gemm.py` for the multi-CTA / persistent-kernel pattern. The L>1 batched case requires either explicit per-CTA TMEM management (separate TMEM regions) or the persistent-kernel work-distribution loop, not the simple single-GEMM control flow of `fp16_gemm_0.py`.
-2. The L=1 path in `kernel.py` is the proof that FP8 `MmaFP8Op` UMMA works and produces correct output — that's a concrete foundation, not a wasted effort.
-3. Once L>1 correct, plug into `binding.py` via `INDEXER_BACKEND=cute_dsl` env-var dispatch (slot already exists in the plan), then run `KERNEL=indexer uvx modal run scripts/run_modal_paired_bench.py` against the frozen Phase 2c baseline.
+### Phase 2 entry point (next session)
+
+The Phase 1 path is correct but at-parity. To unlock the UMMA win:
+
+1. **Move pre-gather K into the kernel.** Currently `binding.py` does `k_fp8[bt_safe]` (torch indexing). In CuTe DSL, this becomes a sparse-gather load — either (a) one TMA-per-page indexed by block_table loaded via cp.async, or (b) `ComposedLayout` + `CustomStride(gather_functor, ...)` per FlashMLA's pattern. Eliminates a B×max_pages×64×128 gathered-K materialization.
+2. **Move pre-replicate Q into the kernel.** Currently `q_index_fp8.unsqueeze(1).expand(...)`. In-kernel, each (batch, page) CTA simply loads `Q[batch]` via TMA — no replication needed.
+3. **Move post-process (ReLU + Σ_h w[h]·S[h, slot] · scale[slot]) into the epilogue.** Current implementation does this via `torch.relu` + `torch.einsum` + multiply. In-kernel, after TMEM→RMEM copy of S, apply the fused epilogue per the DeepGEMM `sm100_fp8_mqa_logits.cuh` reference (lines 341–374, register-resident `__ffma2_rn` over head pairs).
+4. **Grid restructure**: instead of `(1, 1, B*max_pages)` and Python pre-gather, use `(max_pages, B, 1)` with an in-kernel block_table indirection. Matches Phase 2c's grid pattern.
+
+After (1)+(2)+(3) the Python wrapper drops to: input passthrough + topk + remap (Stage B unchanged from Phase 3). Expected speedup: 2-4× over Phase 2c (UMMA engagement, no Python overhead).
 
 ## Final submission
 
