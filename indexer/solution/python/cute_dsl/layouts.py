@@ -162,18 +162,19 @@ def sWeights_layout():
 def make_indexer_tiled_mma():
     """Construct the FP8 UMMA atom for the indexer scoring GEMM.
 
-    Exact API name may need adjustment against installed CuTe DSL version.
-    The canonical form per `examples/python/CuTeDSL/blackwell/` tutorials:
+    The atom name verified against the installed nvidia-cutlass-dsl package
+    by scripts/cute_dsl_smoke.py (commit ba8e05b): tcgen05.MmaFP8Op is
+    present; tcgen05.MmaF8F6F4Op is NOT. Constructor signature follows
+    the tcgen05.MmaF16BF16Op pattern from fp16_gemm_0.py (positional args).
     """
-    op = tcgen05.MmaF8F6F4Op(
-        io_dtype=cutlass.Float8_E4M3,
-        acc_dtype=cutlass.Float32,
-        mma_tile_shape=MMA_TILE_SHAPE,
-        cta_group=tcgen05.CtaGroup.ONE,
-        a_source=tcgen05.OperandSource.SMEM,
-        b_source=tcgen05.OperandSource.SMEM,
-        a_major_mode=tcgen05.OperandMajorMode.K,
-        b_major_mode=tcgen05.OperandMajorMode.K,
+    op = tcgen05.MmaFP8Op(
+        cutlass.Float8E4M3FN,    # io_dtype
+        cutlass.Float32,          # acc_dtype
+        MMA_TILE_SHAPE,           # (M, N, K)
+        tcgen05.CtaGroup.ONE,
+        tcgen05.OperandSource.SMEM,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
     )
     return cute.make_tiled_mma(op)
 
